@@ -5,6 +5,7 @@
 #include "WiFi.h"
 #include "WiFiServer.h"
 #include "WiFiClient.h"
+#include "DNSServer.h"
 #include "FlashMemory.h"
 #include "wifi_conf.h"
 #include "wifi_structures.h"
@@ -34,7 +35,22 @@ extern "C" {
   extern struct netif xnetif[];           // [0]=WLAN0/STA  [1]=WLAN1/AP
   void dhcps_init(struct netif *pnetif);  // Realtek DHCP server başlat
   void dhcps_deinit(void);               // Realtek DHCP server durdur
+  int  LwIP_DHCP(uint8_t idx, uint8_t action); // STA DHCP istemcisi (0=WLAN0)
+
+  // Concurrent mode STA bağlantısı için kritik:
+  //   wext_set_mode → WLAN0'ı açıkça STA (infrastructure) moduna alır.
+  //   Tarama sonrası WLAN0 belirsiz modda kalır; bu çağrı olmadan
+  //   wifi_connect() çoğunlukla başarısız olur.
+  int  wext_set_mode(const char *ifname, int mode);
+
+  // Her yeni bağlantı denemesi öncesi temiz slate için:
+  int  wifi_disconnect(void);
 }
+
+#define DHCP_START   1
+#define DHCP_STOP    0
+#define IW_MODE_INFRA 2        // Linux wireless ext: infrastructure (STA) modu
+#define WLAN0_NAME   "wlan0"   // AmebaD STA arayüz adı
 
 
 // ─── AP Ayarları ─────────────────────────────────────────────────────────────
@@ -68,6 +84,7 @@ volatile ConnStatus conn_status = CS_IDLE;
 
 // ─── Global Değişkenler ──────────────────────────────────────────────────────
 WiFiServer server(SERVER_PORT);
+DNSServer  dnsServer;
 std::vector<NetworkInfo> networks;
 
 char saved_ssid[MAX_SSID_LEN]   = {0};
@@ -136,36 +153,101 @@ rtw_security_t mapSecurity(uint8_t enc) {
 }
 
 // ─── FreeRTOS: Arka Plan Bağlantı Görevi ────────────────────────────────────
-// AP WLAN1'de kurulu (setup'ta wifi_start_ap + dhcps_init(&xnetif[1]) ile).
-// wifi_connect() YALNIZCA WLAN0'ı (STA arayüzü) kullanır.
-// WLAN1'deki AP DOKUNULMAZ — beacon'lar kesilmez, telefon bağlı kalır.
-// WiFi.apbegin() veya server.begin() burada ÇAĞRILMAZ.
+// AP WLAN1'de kurulu — wifi_connect() sadece WLAN0'ı kullanır, AP dokunulmaz.
+//
+// CONCURRENT MODE BAĞLANTI SIRASI (AmebaD SDK zorunluluğu):
+//   1. wifi_disconnect()              → önceki association temizle
+//   2. wext_set_mode(wlan0, STA)      → WLAN0'ı açıkça STA moduna al
+//      * Tarama sonrası WLAN0 belirsiz modda kalır; bu adım atlanırsa
+//        wifi_connect() çoğunlukla başarısız olur (en sık kök neden).
+//   3. vTaskDelay(200ms)              → mod değişikliğinin settle etmesi için
+//   4. wifi_connect(...)              → bağlan
+//   5. LwIP_DHCP(0, DHCP_START)      → WLAN0'a IP ata (otomatik atanmaz)
 void wifiConnectTask(void *param) {
   (void)param;
-  rtw_security_t sec = mapSecurity(pending_enc);
-  int pass_len = (sec == RTW_SECURITY_OPEN) ? 0 : (int)strlen(pending_pass);
 
-  Serial.print("[Task] WLAN0 ile bağlanılıyor -> "); Serial.println(pending_ssid);
-  Serial.println("[Task] WLAN1/AP etkilenmeyecek (concurrent mode)");
+  bool is_open = (mapSecurity(pending_enc) == RTW_SECURITY_OPEN);
+  int  pass_len = is_open ? 0 : (int)strlen(pending_pass);
 
-  int ret = wifi_connect(
-    (char *)pending_ssid,
-    sec,
-    (char *)pending_pass,
-    (int)strlen(pending_ssid),
-    pass_len,
-    -1,
-    NULL
-  );
+  // Güvenlik türü deneme sırası — önce tespit edilen, sonra geniş uyumluluk
+  // WPA3: bazı SDK sürümlerinde RTW_SECURITY_WPA3_AES_PSK mevcut olmayabilir,
+  // ifdef ile korunuyor.
+  rtw_security_t try_sec[] = {
+    mapSecurity(pending_enc),    // 1. Taramanın tespit ettiği
+    RTW_SECURITY_WPA2_AES_PSK,   // 2. WPA2 AES (en yaygın)
+    RTW_SECURITY_WPA2_MIXED_PSK, // 3. WPA2 AES+TKIP karma
+#ifdef RTW_SECURITY_WPA3_AES_PSK
+    RTW_SECURITY_WPA3_AES_PSK,   // 4. WPA3 (modern router)
+#endif
+  };
+  int try_count = is_open ? 1 : (int)(sizeof(try_sec) / sizeof(try_sec[0]));
 
-  Serial.print("[Task] wifi_connect sonuc="); Serial.println(ret);
+  Serial.print("[Task] Baslaniyor: "); Serial.println(pending_ssid);
+  Serial.print("[Task] pass_len="); Serial.print(pass_len);
+  Serial.print(" enc="); Serial.println((int)pending_enc);
+
+  int ret = RTW_ERROR;
+
+  for (int t = 0; t < try_count; t++) {
+    // Aynı güvenlik türünü tekrar deneme
+    bool dup = false;
+    for (int j = 0; j < t; j++) {
+      if (try_sec[j] == try_sec[t]) { dup = true; break; }
+    }
+    if (dup) continue;
+
+    Serial.print("[Task] --- Deneme "); Serial.print(t + 1);
+    Serial.print(" sec="); Serial.println((int)try_sec[t]);
+
+    // Adım 1: Önceki bağlantıyı temizle
+    wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(300));
+
+    // Adım 2: WLAN0'ı açıkça STA (infrastructure) moduna al
+    // Bu adım concurrent mode'da wifi_connect() başarısı için kritik!
+    int mode_ret = wext_set_mode(WLAN0_NAME, IW_MODE_INFRA);
+    Serial.print("[Task] wext_set_mode ret="); Serial.println(mode_ret);
+    vTaskDelay(pdMS_TO_TICKS(200)); // mod settle etsin
+
+    // Adım 3: Bağlan
+    ret = wifi_connect(
+      (char *)pending_ssid,
+      try_sec[t],
+      (char *)pending_pass,
+      (int)strlen(pending_ssid),
+      pass_len,
+      -1,
+      NULL
+    );
+
+    Serial.print("[Task] wifi_connect ret="); Serial.println(ret);
+
+    if (ret == RTW_SUCCESS) {
+      // Gerçekten bağlandı mı doğrula
+      vTaskDelay(pdMS_TO_TICKS(500));
+      if (wifi_is_connected_to_ap() == RTW_SUCCESS) {
+        Serial.println("[Task] Baglanti dogrulandi.");
+        break;
+      } else {
+        Serial.println("[Task] wifi_connect OK ama is_connected FAIL, tekrar denenecek.");
+        ret = RTW_ERROR;
+      }
+    }
+
+    if (t < try_count - 1) vTaskDelay(pdMS_TO_TICKS(2000));
+  }
 
   if (ret == RTW_SUCCESS) {
-    conn_status = CS_DONE_OK;
+    // WLAN0 üzerinde DHCP istemcisini başlat → STA IP adresi alır
+    // wifi_connect() başarılı olsa bile IP otomatik atanmaz!
+    Serial.println("[Task] DHCP baslatiliyor (WLAN0)...");
+    LwIP_DHCP(0, DHCP_START);
+    vTaskDelay(pdMS_TO_TICKS(3000)); // DHCP sunucusundan IP alınması için bekle
     Serial.println("[Task] STA OK — AP HALA AYAKTA.");
+    conn_status = CS_DONE_OK;
   } else {
+    Serial.println("[Task] STA FAIL — tum denemeler basarisiz.");
     conn_status = CS_DONE_FAIL;
-    Serial.println("[Task] STA FAIL — AP HALA AYAKTA.");
   }
 
   vTaskDelete(NULL);
@@ -178,9 +260,9 @@ void startConnectTask() {
   xTaskCreate(
     wifiConnectTask,   // Görev fonksiyonu
     "wconn",           // İsim
-    4096,              // Stack boyutu
+    8192,              // Stack boyutu — wifi_connect() + LwIP_DHCP için yeterli
     NULL,              // Parametre
-    tskIDLE_PRIORITY + 1,
+    tskIDLE_PRIORITY + 2,
     NULL               // Task handle (kullanmıyoruz)
   );
 }
@@ -376,16 +458,44 @@ void handleClient(WiFiClient &client) {
   int qm = path.indexOf('?');
   if (qm != -1) path = path.substring(0, qm);
 
+  // Host başlığını oku
+  String hostHeader = "";
+  {
+    int hi = request.indexOf("Host: ");
+    if (hi != -1) {
+      int he = request.indexOf("\r\n", hi + 6);
+      hostHeader = request.substring(hi + 6, he);
+      hostHeader.trim();
+      // Port varsa kaldır (:80 gibi)
+      int cp = hostHeader.indexOf(':');
+      if (cp != -1) hostHeader = hostHeader.substring(0, cp);
+    }
+  }
+
   Serial.print("[HTTP] ");
   if (request.startsWith("POST")) Serial.print("POST "); else Serial.print("GET  ");
-  Serial.println(path);
+  Serial.print(path);
+  Serial.print(" Host="); Serial.println(hostHeader);
 
-  bool is_captive =
+  // Captive portal tespiti:
+  //   1) Bilinen kontrol URL'leri (path bazlı)
+  //   2) Host, AP IP'sine gitmiyorsa → büyük olasılıkla captive portal kontrolü
+  bool path_is_captive =
     path.indexOf("hotspot-detect") != -1 || path.indexOf("generate_204")   != -1 ||
     path.indexOf("ncsi.txt")       != -1 || path.indexOf("success.txt")    != -1 ||
-    path.indexOf("connecttest")    != -1 || path.indexOf("canonical.html") != -1;
+    path.indexOf("connecttest")    != -1 || path.indexOf("canonical.html") != -1 ||
+    path.indexOf("redirect")       != -1 || path.indexOf("portal")         != -1;
 
-  if (is_captive) { client.print(buildRedirect()); return; }
+  bool host_is_foreign = (hostHeader.length() > 0 && hostHeader != AP_IP_ADDR);
+
+  if (path_is_captive || host_is_foreign) {
+    // iOS: captive.apple.com/hotspot-detect.html — boş HTML döndürünce popup açar
+    // Android: generate_204 — 302 alınca captive portal bildirimi çıkar
+    // Windows: ncsi.txt / connecttest.txt — redirect görünce portal popup açar
+    client.print(buildRedirect());
+    Serial.print("[Captive] Redirect -> "); Serial.println(AP_IP_ADDR);
+    return;
+  }
 
   // POST /connect — görevi başlat, hemen cevap ver, loop() hiç durmaz
   if (request.startsWith("POST") && path == "/connect") {
@@ -468,12 +578,18 @@ void setup() {
     IP4_ADDR(&mask, 255, 255, 255, 0);
     IP4_ADDR(&gw,   192, 168, 4, 1);
     netif_set_addr(&xnetif[1], &ip, &mask, &gw);
-    Serial.println("[AP] WLAN1 IP: 192.168.4.1");
+    // netif_set_up  : "admin up" — arayüz yönetimsel olarak aktif
+    // netif_set_link_up : "link up" — fiziksel bağlantı aktif
+    // Her ikisi de gerekli; sadece birisi DHCP server'ın çalışması için yetmez.
+    netif_set_up(&xnetif[1]);
+    netif_set_link_up(&xnetif[1]);
+    Serial.println("[AP] WLAN1 IP: 192.168.4.1 (netif up + link up)");
   }
 
-  // Adım 4: Mevcut DHCP sunucusunu durdur, WLAN1'de yeniden başlat
-  dhcps_deinit();
-  delay(100);
+  // Adım 4: DHCP sunucusunu WLAN1'de başlat
+  // NOT: dhcps_deinit() burada ÇAĞRILMIYOR — ilk boot'ta çalışan sunucu yok,
+  // dhcps_deinit() NULL pointer erişimi yaparak watchdog reset'e yol açabilir.
+  // dhcps_init() zaten önceki başlatılmamış durumu handle eder.
   dhcps_init(&xnetif[1]);
   delay(500);
   Serial.println("[AP] DHCP server WLAN1'de baslatildi.");
@@ -494,6 +610,15 @@ void setup() {
 
   server.begin();
   Serial.println("[Server] Port 80 hazir.");
+
+  // DNS sunucusu başlat — tüm hostname sorgularını 192.168.4.1'e yönlendirir
+  // Bu olmadan telefon captive.apple.com / connectivitycheck.gstatic.com'u çözemez
+  // → captive portal popup açılmaz.
+  // lwIP native udp_pcb kullanır (WiFiUDP wrapper'ından çok daha güvenilir AmebaD'de)
+  dnsServer.setResolvedIP(192, 168, 4, 1);
+  dnsServer.begin();
+  Serial.println("[DNS] Port 53 hazir (lwIP native).");
+
   Serial.println("[Hazir] http://192.168.4.1");
 }
 
