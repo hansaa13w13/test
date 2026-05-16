@@ -131,6 +131,4 @@ void wifi_tx_assoc_req(void* sta_mac, void* bssid, const char* ssid);
 void wifi_tx_broadcast_deauth(void* bssid, uint16_t reason, int burstCount, int interDelayUs);
 void wifi_tx_broadcast_disassoc(void* bssid, uint16_t reason, int burstCount, int interDelayUs);
 
-
-
 #endif

@@ -32,11 +32,23 @@ void DNSServer::begin() {
         }
     }
 
-    _dns_server_pcb = udp_new();
-    Serial.println("Created new DNS server PCB");
+    // udp_new() lwIP stack hazır değilse NULL döner.
+    for (int _retry = 0; _retry < 3 && !_dns_server_pcb; _retry++) {
+        _dns_server_pcb = udp_new();
+        if (!_dns_server_pcb) {
+            Serial.print("[DNS] udp_new() bekleniyor, deneme ");
+            Serial.println(_retry + 1);
+            delay(300);
+        }
+    }
+    if (!_dns_server_pcb) {
+        Serial.println("[DNS] HATA: udp_new() basarisiz, DNS sunucusu baslamiyor!");
+        return;
+    }
+    Serial.println("[DNS] Yeni DNS PCB olusturuldu.");
     udp_bind(_dns_server_pcb, IP4_ADDR_ANY, DNS_SERVER_PORT);
     udp_recv(_dns_server_pcb, (udp_recv_fn)packetHandler, NULL);
-    Serial.println("DNS server bound to port");
+    Serial.println("[DNS] Port 53 dinlemede.");
 }
 
 void DNSServer::stop() {
@@ -132,8 +144,3 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
 
     pbuf_free(udp_packet_buffer);
 }
-
-
-
-
-
