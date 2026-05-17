@@ -1,7 +1,7 @@
 // AP+STA Captive Portal — RTL8720dn (AmebaD)
-// GÜNCELLEME: Flash Hafıza Çökmesi/Bozulması Engellendi (Güvenli Sektör 0x100000 Kullanıldı)
-// YENİLİK: CSS Bozulma Koruması + Panel + Otomatik Reboot (Tam Kararlı Sürüm)
+// NİHAİ SÜRÜM: Orijinal Ağ Mantığı + CSS Bozulma Koruması + Panel + Çift Çekirdekli Otomatik Reboot (sys_reset)
 
+#include "sys_api.h"  // YENİ EKLENEN KÜTÜPHANE: Realtek Çift Çekirdek Reset İşlemleri İçin
 #include "WiFi.h"
 #include "WiFiServer.h"
 #include "WiFiClient.h"
@@ -324,8 +324,7 @@ void saveCredentials(const char *ssid, const char *pass) {
   strncpy(creds.pass, pass, MAX_PASS_LEN - 1);
   memcpy(FlashMemory.buf, &creds, sizeof(creds));
   FlashMemory.update();
-  // Yazılımın bozulmaması için çipe kaydı fiziksel olarak bitirme süresi veriyoruz
-  delay(1000); 
+  delay(1000); // Yazılımın bozulmaması için çipe kaydı fiziksel olarak bitirme süresi
 }
 
 rtw_security_t mapSecurity(uint8_t enc) {
@@ -779,7 +778,7 @@ void loop() {
     strncpy(saved_ssid, pending_ssid, MAX_SSID_LEN - 1);
     strncpy(saved_pass, pending_pass, MAX_PASS_LEN - 1);
     
-    // Güvenli hafızaya kayıt (Çökmeyi engeller)
+    // Güvenli hafızaya kayıt
     saveCredentials(saved_ssid, saved_pass);
     
     conn_result = "ok"; 
@@ -791,11 +790,13 @@ void loop() {
     sta_connected = false; conn_result = "fail"; conn_status = CS_IDLE;
   }
 
-  // SİSTEMİ TAMAMEN SIFIRLAYARAK X AĞINA TEMİZ DÖNÜŞ YAPAR
+  // SİSTEMİ TAMAMEN SIFIRLAYARAK X AĞINA TEMİZ DÖNÜŞ YAPAR (REALTEK KOMUTU İLE)
   if (revert_time > 0 && millis() > revert_time) {
     revert_time = 0;
     Serial.println("\n[Revert] Sifre dogrulandi, X agina donmek icin yeniden baslatiliyor...");
-    NVIC_SystemReset();
+    Serial.flush(); // Serial mesajının tamamen yazdırılmasını bekle
+    delay(200);     // Donanıma nefes alma payı
+    sys_reset();    // REALTEK RESMİ RESET KOMUTU
   }
 
   if (conn_status == CS_IDLE && scan_status == SCAN_IDLE && !ap_switched && (millis() - last_scan_ms > RESCAN_INTERVAL_MS)) {
