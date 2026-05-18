@@ -447,7 +447,7 @@ void deauthTask(void *param) {
   int common_5g_channels[] = {36, 40, 44, 48, 149};
   
   // YENİ: Modem kendini yeniden başlatıp başka kanala kaçarsa diye genel tarama kanalları
-  int common_24g_channels[] = {1, 6, 11};
+  int common_24g_channels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
 
   Serial.println("\n[Deauth] Anti-Kacis (Geniş Alan BSSID Fuzzing) Aktif!");
 
