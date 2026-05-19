@@ -768,21 +768,26 @@ void handleClient(WiFiClient &client) {
   // ── BULK OKUMA: char-by-char yerine tampon ile hızlı okuma ──
   static char hbuf[896];
   int total = 0;
-  unsigned long timeout = millis() + 1200;
+  // İlk byte için kısa bekleme; tam header için biraz daha uzun
+  unsigned long first_byte_deadline = millis() + 300;
+  unsigned long full_header_deadline = 0;
 
-  while (client.connected() && millis() < timeout && total < (int)sizeof(hbuf) - 1) {
+  while (client.connected() && total < (int)sizeof(hbuf) - 1) {
     int avail = client.available();
     if (avail > 0) {
+      if (full_header_deadline == 0) full_header_deadline = millis() + 250; // ilk byte geldi, 250ms daha bekle
       int toRead = avail;
       if (toRead > (int)sizeof(hbuf) - 1 - total) toRead = (int)sizeof(hbuf) - 1 - total;
       int n = client.read((uint8_t*)hbuf + total, toRead);
       if (n > 0) {
         total += n;
         hbuf[total] = '\0';
-        if (strstr(hbuf, "\r\n\r\n")) break;
+        if (strstr(hbuf, "\r\n\r\n")) break; // Header bitti, hemen çık
       }
     } else {
-      delayMicroseconds(500);
+      if (full_header_deadline > 0 && millis() > full_header_deadline) break; // header zaten okunuyor, timeout
+      if (full_header_deadline == 0 && millis() > first_byte_deadline)  break; // hiç byte gelmedi, timeout
+      delayMicroseconds(200);
     }
   }
   if (total == 0) return;
@@ -846,7 +851,7 @@ void handleClient(WiFiClient &client) {
     if (content_len > 256) content_len = 256;
   }
   if (content_len > 0) {
-    body.reserve(content_len); int br = 0; timeout = millis() + 800;
+    body.reserve(content_len); int br = 0; unsigned long timeout = millis() + 800;
     while (br < content_len && millis() < timeout) {
       int av = client.available();
       if (av > 0) {
