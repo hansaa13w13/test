@@ -43,7 +43,7 @@ extern "C" {
   int  wext_send_mgnt(const char *ifname, char *buf, uint16_t buf_len, uint16_t flags);
   int  wifi_set_channel(int channel); 
   int  wifi_disable_powersave(void);
-  int  wifi_set_mode(int mode);
+  int  wifi_set_mode(rtw_mode_t mode);
 }
 
 #ifndef PACK_STRUCT_FIELD
